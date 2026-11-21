@@ -478,9 +478,27 @@ impl Writer {
     }
 }
 
-/// Writes a whole output file. `PIPELINE_FSYNC=1` (diagnostics) also flushes
-/// it to disk before returning, which moves the flush the container's exit
-/// otherwise waits for into the phase log.
+static WRITEBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether each output file's writeback to disk is started as soon as it is
+/// written (the default).
+pub fn set_writeback(on: bool) {
+    WRITEBACK.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Creates both output folders; returns the user_daily one.
+pub fn create_dirs(output: &Path) -> std::path::PathBuf {
+    let user_dir = output.join("user_daily");
+    std::fs::create_dir_all(&user_dir).expect("create user_daily");
+    std::fs::create_dir_all(output.join("campaign_daily")).expect("create campaign_daily");
+    user_dir
+}
+
+/// Writes a whole output file and starts its writeback to disk without
+/// waiting for it: `docker run` returns only once the container's output is
+/// on disk, so the sooner the disk starts, the less is left at exit.
+/// `PIPELINE_FSYNC=1` (diagnostics) instead waits for the flush here, which
+/// moves it into the phase log.
 fn write_file(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     let fail = |error: std::io::Error| -> ! { panic!("write {}: {error}", path.display()) };
@@ -488,10 +506,27 @@ fn write_file(path: &Path, bytes: &[u8]) {
     file.write_all(bytes).unwrap_or_else(|e| fail(e));
     if std::env::var_os("PIPELINE_FSYNC").is_some_and(|v| v == "1") {
         file.sync_data().unwrap_or_else(|e| fail(e));
+    } else if WRITEBACK.load(std::sync::atomic::Ordering::Relaxed) {
+        start_writeback(&file);
     }
 }
 
-fn write_user_daily(path: &Path, rows: &[UserDay], lookups: &Lookups, strings: &Strings) {
+#[cfg(target_os = "linux")]
+fn start_writeback(file: &std::fs::File) {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn sync_file_range(fd: i32, offset: i64, nbytes: i64, flags: u32) -> i32;
+    }
+    const SYNC_FILE_RANGE_WRITE: u32 = 2;
+    // SAFETY: a valid open descriptor; the whole file; only starts writeback.
+    unsafe { sync_file_range(file.as_raw_fd(), 0, 0, SYNC_FILE_RANGE_WRITE) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_file: &std::fs::File) {}
+
+/// Writes `rows` as one user_daily Parquet file.
+pub fn write_user_daily(path: &Path, rows: &[UserDay], lookups: &Lookups, strings: &Strings) {
     let mut writer = Writer::new();
     for group in rows.chunks(ROW_GROUP_ROWS) {
         if std::env::var_os("PIPELINE_PLAIN_OUTPUT").is_some_and(|v| v == "1") {
@@ -536,10 +571,8 @@ fn write_user_daily(path: &Path, rows: &[UserDay], lookups: &Lookups, strings: &
 }
 
 pub fn write_all(output: &Path, results: Vec<ThreadResult>, lookups: &Lookups, window: &Window, strings: &Strings, threads: usize) {
-    let user_dir = output.join("user_daily");
+    let user_dir = create_dirs(output);
     let campaign_dir = output.join("campaign_daily");
-    std::fs::create_dir_all(&user_dir).expect("create user_daily");
-    std::fs::create_dir_all(&campaign_dir).expect("create campaign_daily");
 
     let days = window.days;
     let user_rows: Vec<Vec<UserDay>> = results.iter().map(|_| Vec::new()).collect();

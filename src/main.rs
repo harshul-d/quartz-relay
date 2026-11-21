@@ -165,7 +165,12 @@ fn main() {
     drop(names);
     let strings = interner.finish();
 
-    let results = sessionize(events.people, deletions, clicks, &lookups, &window, &strings, threads);
+    // `PIPELINE_EARLY_WRITE=0` (A/B only): write everything at the end, no writeback hints.
+    let early = std::env::var_os("PIPELINE_EARLY_WRITE").is_none_or(|v| v != "0");
+    out::set_writeback(early);
+    let user_dir = out::create_dirs(&output);
+    let results =
+        sessionize(events.people, deletions, clicks, &lookups, &window, &strings, threads, early.then_some(&*user_dir));
     log("sessionized");
 
     out::write_all(&output, results, &lookups, &window, &strings, threads);
@@ -533,10 +538,17 @@ fn parse_clicks(
 
 /// Results of one thread's share of the sessionizing.
 pub struct ThreadResult {
+    /// user_daily rows not yet written.
     pub user_days: Vec<UserDay>,
     /// Indexed by campaign * days + day offset; the last campaign is `organic`.
     pub campaigns: Vec<CampaignCounts>,
+    thread: usize,
+    files: usize,
 }
+
+/// user_daily rows a sessionizing thread collects before it writes them out
+/// (see `sessionize`).
+const EARLY_FILE_ROWS: usize = 1 << 16;
 
 struct Session {
     start: i64,
@@ -555,6 +567,7 @@ fn sessionize(
     window: &Window,
     strings: &Strings,
     threads: usize,
+    early_dir: Option<&Path>,
 ) -> Vec<ThreadResult> {
     let organic = lookups.campaign_names.len();
     let days = window.days;
@@ -563,7 +576,12 @@ fn sessionize(
     par::run(
         threads,
         PARTITIONS,
-        |_| ThreadResult { user_days: Vec::new(), campaigns: vec![[0; 4]; (organic + 1) * days] },
+        |thread| ThreadResult {
+            user_days: Vec::new(),
+            campaigns: vec![[0; 4]; (organic + 1) * days],
+            thread,
+            files: 0,
+        },
         |result, item| {
             let index = order[item];
             let begin = Instant::now();
@@ -760,6 +778,18 @@ fn sessionize(
             };
             timing::ATTRIBUTION.add_nanos(attribution);
             timing::SESSIONS.add_nanos(nanos - attribution);
+
+            // Write finished rows while sessionizing goes on, so the disk works
+            // in parallel: the container's exit waits for the output to be on
+            // disk (PROGRESS.md, H5b).
+            if let Some(dir) = early_dir {
+                if result.user_days.len() >= EARLY_FILE_ROWS {
+                    let name = format!("part-t{:02}-{:04}.parquet", result.thread, result.files);
+                    out::write_user_daily(&dir.join(name), &result.user_days, lookups, strings);
+                    result.files += 1;
+                    result.user_days.clear();
+                }
+            }
         },
     )
 }
