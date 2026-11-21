@@ -23,8 +23,10 @@ const CONVERTED_UTF8: i32 = 0;
 const CONVERTED_DATE: i32 = 6;
 const ENCODING_PLAIN: i32 = 0;
 const ENCODING_RLE: i32 = 3;
+const ENCODING_RLE_DICTIONARY: i32 = 8;
 const CODEC_UNCOMPRESSED: i32 = 0;
 const PAGE_DATA: i32 = 0;
+const PAGE_DICTIONARY: i32 = 2;
 
 // Thrift compact protocol field types.
 const T_I32: u8 = 5;
@@ -129,15 +131,172 @@ const CAMPAIGN_DAILY: [Column; 7] = [
     column("assisted_sessions", TYPE_INT64, false, None),
 ];
 
-/// A column's values for one row group, PLAIN encoded, with definition
-/// levels (1 = present) for an optional column.
+/// A column's values for one row group, PLAIN encoded or (with `dict`)
+/// dictionary encoded, with definition levels (1 = present) for an optional
+/// column.
 #[derive(Default)]
 struct ColumnData {
     values: Vec<u8>,
     levels: Vec<bool>,
+    dict: Option<Dictionary>,
+}
+
+/// A dictionary-encoded column chunk: the distinct values (PLAIN encoded,
+/// in index order) and one index per present value. Smaller output matters:
+/// the run ends only once the output is on disk (see PROGRESS.md, H5b).
+#[derive(Default)]
+struct Dictionary {
+    values: Vec<u8>,
+    count: u32,
+    indices: Vec<u32>,
+    /// Open addressing: (key, 1 + index), 0 = empty.
+    slots: Vec<(u64, u32)>,
+}
+
+impl Dictionary {
+    /// The index of the value identified by `key`; a new value's PLAIN bytes
+    /// are appended by `fill`.
+    #[inline]
+    fn index_of(&mut self, key: u64, fill: impl FnOnce(&mut Vec<u8>)) -> u32 {
+        if self.count as usize * 2 >= self.slots.len() {
+            self.grow();
+        }
+        let mask = self.slots.len() - 1;
+        let mut slot = crate::key::hash(key as u128) as usize & mask;
+        loop {
+            let (held, index) = self.slots[slot];
+            if index == 0 {
+                self.slots[slot] = (key, self.count + 1);
+                return self.add(fill);
+            }
+            if held == key {
+                return index - 1;
+            }
+            slot = (slot + 1) & mask;
+        }
+    }
+
+    /// Appends a new value without lookup (the caller knows it is new).
+    #[inline]
+    fn add(&mut self, fill: impl FnOnce(&mut Vec<u8>)) -> u32 {
+        fill(&mut self.values);
+        self.count += 1;
+        self.count - 1
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let size = (self.slots.len() * 2).max(64);
+        let old = std::mem::replace(&mut self.slots, vec![(0, 0); size]);
+        for (key, index) in old {
+            if index != 0 {
+                let mut slot = crate::key::hash(key as u128) as usize & (size - 1);
+                while self.slots[slot].1 != 0 {
+                    slot = (slot + 1) & (size - 1);
+                }
+                self.slots[slot] = (key, index);
+            }
+        }
+    }
+}
+
+fn varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// The RLE / bit-packing hybrid encoding of `values` at `width` bits, as
+/// whichever is smaller: one RLE run per run of equal values, or a single
+/// bit-packed run (padded to a multiple of 8 values).
+fn hybrid(values: &[u32], width: u32, out: &mut Vec<u8>) {
+    let value_bytes = width.div_ceil(8) as usize;
+    let mut rle_size = 0usize;
+    let mut at = 0;
+    while at < values.len() {
+        let start = at;
+        while at < values.len() && values[at] == values[start] {
+            at += 1;
+        }
+        rle_size += varint_len(((at - start) as u64) << 1) + value_bytes;
+    }
+    let groups = values.len().div_ceil(8);
+    let packed_size = varint_len((groups as u64) << 1 | 1) + groups * width as usize;
+    if rle_size <= packed_size {
+        let mut at = 0;
+        while at < values.len() {
+            let start = at;
+            while at < values.len() && values[at] == values[start] {
+                at += 1;
+            }
+            varint(out, ((at - start) as u64) << 1);
+            out.extend_from_slice(&values[start].to_le_bytes()[..value_bytes]);
+        }
+    } else {
+        varint(out, (groups as u64) << 1 | 1);
+        let mut buffer = 0u64;
+        let mut bits = 0u32;
+        for index in 0..groups * 8 {
+            buffer |= (values.get(index).copied().unwrap_or(0) as u64) << bits;
+            bits += width;
+            while bits >= 8 {
+                out.push(buffer as u8);
+                buffer >>= 8;
+                bits -= 8;
+            }
+        }
+    }
+}
+
+fn varint_len(value: u64) -> usize {
+    (64 - value.max(1).leading_zeros() as usize).div_ceil(7)
 }
 
 impl ColumnData {
+    fn dictionary() -> ColumnData {
+        ColumnData { dict: Some(Dictionary::default()), ..ColumnData::default() }
+    }
+    fn dict(&mut self) -> &mut Dictionary {
+        self.dict.as_mut().expect("a dictionary column")
+    }
+    fn dict_int32(&mut self, value: i32) {
+        let dict = self.dict();
+        let index = dict.index_of(value as u32 as u64, |out| out.extend_from_slice(&value.to_le_bytes()));
+        dict.indices.push(index);
+    }
+    fn dict_int64(&mut self, value: i64) {
+        let dict = self.dict();
+        let index = dict.index_of(value as u64, |out| out.extend_from_slice(&value.to_le_bytes()));
+        dict.indices.push(index);
+    }
+    /// A string identified by `key` (equal keys, equal strings).
+    fn dict_keyed_bytes(&mut self, key: u64, value: &[u8]) {
+        let dict = self.dict();
+        let index = dict.index_of(key, |out| {
+            out.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            out.extend_from_slice(value);
+        });
+        dict.indices.push(index);
+    }
+    /// A string equal to the previous row's when `repeat`, else a new
+    /// dictionary entry written by `fill` (rows come grouped by person).
+    fn dict_next_bytes(&mut self, repeat: bool, fill: impl FnOnce(&mut Vec<u8>)) {
+        let dict = self.dict();
+        let index = if repeat && dict.count > 0 {
+            dict.count - 1
+        } else {
+            dict.add(|out| {
+                let at = out.len();
+                out.extend_from_slice(&[0; 4]);
+                fill(out);
+                let length = (out.len() - at - 4) as u32;
+                out[at..at + 4].copy_from_slice(&length.to_le_bytes());
+            })
+        };
+        dict.indices.push(index);
+    }
     fn int32(&mut self, value: i32) {
         self.values.extend_from_slice(&value.to_le_bytes());
     }
@@ -148,14 +307,6 @@ impl ColumnData {
         self.values.extend_from_slice(&(value.len() as u32).to_le_bytes());
         self.values.extend_from_slice(value);
     }
-    /// A string whose bytes are appended by `fill`.
-    fn bytes_with(&mut self, fill: impl FnOnce(&mut Vec<u8>)) {
-        let at = self.values.len();
-        self.values.extend_from_slice(&[0; 4]);
-        fill(&mut self.values);
-        let length = (self.values.len() - at - 4) as u32;
-        self.values[at..at + 4].copy_from_slice(&length.to_le_bytes());
-    }
     fn null(&mut self) {
         self.levels.push(false);
     }
@@ -165,9 +316,12 @@ impl ColumnData {
 }
 
 struct ChunkMeta {
+    /// Start of the column chunk (its dictionary page, if any).
     offset: u64,
     size: u64,
     values: usize,
+    data_offset: u64,
+    dictionary: bool,
 }
 
 struct Writer {
@@ -202,7 +356,28 @@ impl Writer {
                 page.extend_from_slice(&(levels.len() as u32).to_le_bytes());
                 page.extend_from_slice(&levels);
             }
-            page.extend_from_slice(&data.values);
+            let offset = self.file.len() as u64;
+            let dict = data.dict.as_ref().filter(|dict| dict.count > 0);
+            if let Some(dict) = dict {
+                // Dictionary page: the distinct values, PLAIN.
+                let mut header = Thrift::new();
+                header.i32(1, PAGE_DICTIONARY);
+                header.i32(2, dict.values.len() as i32);
+                header.i32(3, dict.values.len() as i32);
+                header.begin(Some(7));
+                header.i32(1, dict.count as i32);
+                header.i32(2, ENCODING_PLAIN);
+                header.end();
+                header.out.push(0);
+                self.file.extend_from_slice(&header.out);
+                self.file.extend_from_slice(&dict.values);
+                // Data page values: the bit width, then the hybrid-encoded indices.
+                let width = (32 - (dict.count - 1).leading_zeros()).max(1);
+                page.push(width as u8);
+                hybrid(&dict.indices, width, &mut page);
+            } else {
+                page.extend_from_slice(&data.values);
+            }
 
             let mut header = Thrift::new();
             header.i32(1, PAGE_DATA);
@@ -210,16 +385,22 @@ impl Writer {
             header.i32(3, page.len() as i32);
             header.begin(Some(5));
             header.i32(1, rows as i32);
-            header.i32(2, ENCODING_PLAIN);
+            header.i32(2, if dict.is_some() { ENCODING_RLE_DICTIONARY } else { ENCODING_PLAIN });
             header.i32(3, ENCODING_RLE);
             header.i32(4, ENCODING_RLE);
             header.end();
             header.out.push(0);
 
-            let offset = self.file.len() as u64;
+            let data_offset = self.file.len() as u64;
             self.file.extend_from_slice(&header.out);
             self.file.extend_from_slice(&page);
-            metas.push(ChunkMeta { offset, size: self.file.len() as u64 - offset, values: rows });
+            metas.push(ChunkMeta {
+                offset,
+                size: self.file.len() as u64 - offset,
+                values: rows,
+                data_offset,
+                dictionary: dict.is_some(),
+            });
         }
         self.row_groups.push((rows, metas));
     }
@@ -258,9 +439,16 @@ impl Writer {
                 meta.i64(2, chunk.offset as i64);
                 meta.begin(Some(3));
                 meta.i32(1, spec.physical);
-                meta.list_header(2, T_I32, 2);
-                meta.zigzag(ENCODING_PLAIN as i64);
-                meta.zigzag(ENCODING_RLE as i64);
+                if chunk.dictionary {
+                    meta.list_header(2, T_I32, 3);
+                    meta.zigzag(ENCODING_PLAIN as i64);
+                    meta.zigzag(ENCODING_RLE as i64);
+                    meta.zigzag(ENCODING_RLE_DICTIONARY as i64);
+                } else {
+                    meta.list_header(2, T_I32, 2);
+                    meta.zigzag(ENCODING_PLAIN as i64);
+                    meta.zigzag(ENCODING_RLE as i64);
+                }
                 meta.list_header(3, T_BINARY, 1);
                 meta.varint(spec.name.len() as u64);
                 meta.out.extend_from_slice(spec.name.as_bytes());
@@ -268,7 +456,10 @@ impl Writer {
                 meta.i64(5, chunk.values as i64);
                 meta.i64(6, chunk.size as i64);
                 meta.i64(7, chunk.size as i64);
-                meta.i64(9, chunk.offset as i64);
+                meta.i64(9, chunk.data_offset as i64);
+                if chunk.dictionary {
+                    meta.i64(11, chunk.offset as i64);
+                }
                 meta.end();
                 meta.end();
             }
@@ -302,18 +493,40 @@ pub fn write_file(path: &Path, bytes: &[u8]) {
 fn write_user_daily(path: &Path, rows: &[UserDay], lookups: &Lookups, strings: &Strings) {
     let mut writer = Writer::new();
     for group in rows.chunks(ROW_GROUP_ROWS) {
-        let mut columns: Vec<ColumnData> = (0..USER_DAILY.len()).map(|_| ColumnData::default()).collect();
+        if std::env::var_os("PIPELINE_PLAIN_OUTPUT").is_some_and(|v| v == "1") {
+            // A/B switch: the previous PLAIN-only layout.
+            let mut columns: Vec<ColumnData> = (0..USER_DAILY.len()).map(|_| ColumnData::default()).collect();
+            for row in group {
+                columns[0].bytes(&strings.bytes(row.person));
+                columns[1].int32(row.day);
+                columns[2].int64(row.sessions as i64);
+                columns[3].int64(row.events as i64);
+                columns[4].int64(row.revenue as i64);
+                if row.top == NO_CATEGORY {
+                    columns[5].null();
+                } else {
+                    columns[5].present();
+                    columns[5].bytes(&lookups.categories[row.top as usize]);
+                }
+            }
+            writer.row_group(&USER_DAILY, &columns, group.len());
+            continue;
+        }
+        let mut columns: Vec<ColumnData> = (0..USER_DAILY.len()).map(|_| ColumnData::dictionary()).collect();
+        let mut previous = None;
         for row in group {
-            columns[0].bytes_with(|out| strings.append(row.person, out));
-            columns[1].int32(row.day);
-            columns[2].int64(row.sessions as i64);
-            columns[3].int64(row.events as i64);
-            columns[4].int64(row.revenue as i64);
+            // A person's rows are adjacent: one dictionary entry per run.
+            columns[0].dict_next_bytes(previous == Some(row.person), |out| strings.append(row.person, out));
+            previous = Some(row.person);
+            columns[1].dict_int32(row.day);
+            columns[2].dict_int64(row.sessions as i64);
+            columns[3].dict_int64(row.events as i64);
+            columns[4].dict_int64(row.revenue as i64);
             if row.top == NO_CATEGORY {
                 columns[5].null();
             } else {
                 columns[5].present();
-                columns[5].bytes(&lookups.categories[row.top as usize]);
+                columns[5].dict_keyed_bytes(row.top as u64, &lookups.categories[row.top as usize]);
             }
         }
         writer.row_group(&USER_DAILY, &columns, group.len());

@@ -47,6 +47,28 @@ impl Interner {
         }
     }
 
+    /// `key(field)` for a `field` that lies inside `chunk`: a short ID is one
+    /// 16-byte load from the chunk, masked to the field's length. (Copying
+    /// the bytes into a buffer and reloading it, as `pack_short` does, stalls
+    /// on store forwarding; that was the parse loop's largest single cost.)
+    #[inline(always)]
+    pub fn key_in(&self, chunk: &[u8], field: &[u8]) -> Key {
+        let length = field.len();
+        if length > 15 {
+            return self.long(field);
+        }
+        let offset = (field.as_ptr() as usize).wrapping_sub(chunk.as_ptr() as usize);
+        debug_assert!(offset <= chunk.len() && offset + length <= chunk.len());
+        match chunk.get(offset..offset.wrapping_add(16)) {
+            Some(window) => {
+                let word = u128::from_be_bytes(window.try_into().unwrap());
+                // Keep the top `length` bytes; the length goes in the lowest byte.
+                (word & !(u128::MAX >> (8 * length))) | length as u128
+            }
+            None => pack_short(field), // the last few bytes of a chunk
+        }
+    }
+
     #[cold]
     fn long(&self, bytes: &[u8]) -> Key {
         let mut guard = self.map.lock().unwrap();
@@ -123,6 +145,31 @@ pub fn hash(key: Key) -> u64 {
     let high = (key >> 64) as u64;
     let first = fold_mul(low ^ 0x243F_6A88_85A3_08D3, 0x9E37_79B9_7F4A_7C15);
     fold_mul(high ^ first, 0xD6E8_FEB8_6659_FD93)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The chunk-load packing equals `pack_short`/`long` for every field
+    /// position and length, including fields at the very end of a chunk.
+    #[test]
+    fn key_in_matches_key() {
+        let interner = Interner::default();
+        let chunk: Vec<u8> = (0..200u32).map(|i| b"az09_,\"Z~"[(i * 7 % 9) as usize] ^ (i as u8 & 0x20)).collect();
+        for start in 0..chunk.len() {
+            for end in start..chunk.len().min(start + 20) + 1 {
+                if end > chunk.len() {
+                    break;
+                }
+                let field = &chunk[start..end];
+                for window in [&chunk[..], &chunk[..end], &chunk[start..end]] {
+                    assert_eq!(interner.key_in(window, field), interner.key(field), "{start}..{end}");
+                }
+            }
+        }
+        assert_eq!(interner.key_in(&chunk, &chunk[5..5]), 0);
+    }
 }
 
 /// Hasher for `HashMap`s keyed by `Key` (or by byte slices, less tuned).

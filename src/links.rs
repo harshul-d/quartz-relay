@@ -171,7 +171,7 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
                     if a.is_empty() || b.is_empty() {
                         return;
                     }
-                    let (a, b) = (interner.key(a), interner.key(b));
+                    let (a, b) = (interner.key_in(bytes, a), interner.key_in(bytes, b));
                     state.pairs.push((a, b));
                     state.endpoints[partition_of(hash(a))].push(a);
                     state.endpoints[partition_of(hash(b))].push(b);

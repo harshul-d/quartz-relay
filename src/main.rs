@@ -399,7 +399,7 @@ fn parse_events(
                     if event_id.is_empty() {
                         return;
                     }
-                    let event_id = interner.key(event_id);
+                    let event_id = interner.key_in(bytes, event_id);
                     // ingest_ts is always valid F1; were it not, the copy sorts last.
                     let ingest = ts::parse(ingest_text).unwrap_or(i64::MAX);
                     'validate: {
@@ -420,12 +420,12 @@ fn parse_events(
                         if purchase {
                             let Some(value) = ts::price(price_text) else { break 'validate };
                             price = value;
-                            category = lookups.products.get(&interner.key(product)).copied().unwrap_or(lookups.unknown);
+                            category = lookups.products.get(&interner.key_in(bytes, product)).copied().unwrap_or(lookups.unknown);
                         }
                         if ingest.saturating_sub(ts) > LATE_LIMIT {
                             break 'validate;
                         }
-                        let user = interner.key(user);
+                        let user = interner.key_in(bytes, user);
                         let hashed = hash(user);
                         names.prefetch_filter(hashed);
                         state.pending.push(Pending {
@@ -563,11 +563,11 @@ fn parse_clicks(
                     if ts < window.click_start || ts >= window.end {
                         return;
                     }
-                    let Some(&campaign) = lookups.campaigns.get(&interner.key(campaign)) else { return };
-                    let user = interner.key(user);
+                    let Some(&campaign) = lookups.campaigns.get(&interner.key_in(bytes, campaign)) else { return };
+                    let user = interner.key_in(bytes, user);
                     let hashed = hash(user);
                     names.prefetch_filter(hashed);
-                    let click = PersonClick { person: user, click_id: interner.key(click_id), ts, campaign };
+                    let click = PersonClick { person: user, click_id: interner.key_in(bytes, click_id), ts, campaign };
                     state.pending.push((click, hashed, false));
                     if state.pending.len() == BATCH {
                         flush(state, names);
