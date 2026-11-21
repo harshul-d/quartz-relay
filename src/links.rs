@@ -151,8 +151,27 @@ impl DenseIds {
     }
 }
 
+/// Every linked ID with its set, for the fast path (`fast.rs`): `keys[x]` is
+/// the ID with dense id `x`, `roots[x]` the dense id of its set's root, whose
+/// key is the set's name (the smallest ID). `sample` holds the first few
+/// thousand link pairs, for key recovery.
+pub struct Linked {
+    pub keys: Vec<Key>,
+    pub roots: Vec<u32>,
+    pub sample: Vec<(Key, Key)>,
+}
+
+/// Link pairs kept in `Linked::sample`.
+const SAMPLE_PAIRS: usize = 8192;
+
 /// Parses every link file and builds the person names.
+#[allow(dead_code)] // tests and examples/parsebench.rs
 pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64) -> Names {
+    build_linked(data, interner, threads, chunk_bytes).0
+}
+
+/// `build`, plus the sets themselves.
+pub fn build_linked(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64) -> (Names, Linked) {
     let files = Files::open_folder(&data.join("links"));
     let chunks = files.chunks(chunk_bytes);
 
@@ -270,15 +289,21 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
             }
         }
     });
+    let sample: Vec<(Key, Key)> = parsed.iter().flat_map(|state| state.pairs.iter().copied()).take(SAMPLE_PAIRS).collect();
     drop(parsed);
     const BLOCK: usize = 1 << 16;
     let mut person_names: Vec<Key> = vec![0; count];
+    let mut roots: Vec<u32> = vec![0; count];
     {
-        let blocks: Vec<Mutex<&mut [Key]>> = person_names.chunks_mut(BLOCK).map(Mutex::new).collect();
+        let blocks: Vec<Mutex<(&mut [Key], &mut [u32])>> =
+            person_names.chunks_mut(BLOCK).zip(roots.chunks_mut(BLOCK)).map(Mutex::new).collect();
         par::run(threads, blocks.len(), |_| (), |_, block| {
-            let mut out = blocks[block].lock().unwrap();
+            let mut guard = blocks[block].lock().unwrap();
+            let (out, out_roots) = &mut *guard;
             for (offset, name) in out.iter_mut().enumerate() {
-                *name = names.keys[find((block * BLOCK + offset) as u32) as usize];
+                let root = find((block * BLOCK + offset) as u32);
+                out_roots[offset] = root;
+                *name = names.keys[root as usize];
             }
         });
     }
@@ -330,7 +355,8 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
         });
     }
     let filter: Vec<u64> = filter.into_iter().map(|word| word.into_inner()).collect();
-    Names { table, table_bits, range_mask, filter, filter_mask }
+    let linked = Linked { keys: names.keys, roots, sample };
+    (Names { table, table_bits, range_mask, filter, filter_mask }, linked)
 }
 /// Byte-wise comparison of two keys while the interner is still open.
 fn compare(interner: &Interner, a: Key, b: Key) -> std::cmp::Ordering {

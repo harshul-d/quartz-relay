@@ -442,6 +442,19 @@ impl Files {
         chunks
     }
 
+    /// The whole lines in the first `limit` bytes of a chunk (for sampling).
+    pub fn head(&self, chunk: &Chunk, limit: usize) -> Vec<u8> {
+        let length = ((chunk.end - chunk.start) as usize).min(limit);
+        let mut buffer = vec![0u8; length];
+        let read = read_at(&self.files[chunk.file], &mut buffer, chunk.start);
+        buffer.truncate(read);
+        if (chunk.start as usize + read) < chunk.end as usize {
+            let keep = buffer.iter().rposition(|&b| b == b'\n').map_or(0, |at| at + 1);
+            buffer.truncate(keep);
+        }
+        buffer
+    }
+
     /// Reads one chunk into this thread's reused buffer and hands it to `f`.
     pub fn with_chunk<R>(&self, chunk: &Chunk, f: impl FnOnce(&[u8]) -> R) -> R {
         if let Some(map) = self.maps.get(chunk.file) {
