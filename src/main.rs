@@ -1077,14 +1077,13 @@ fn attribute(
 
 /// Adds one assist per day for every session starting in `[low, high]`.
 fn count_assists(starts: &[i64], sessions: &[Session], low: i64, high: i64, counts: &mut [CampaignCounts]) {
-    let mut first = starts.partition_point(|&s| s < low);
-    let last = starts.partition_point(|&s| s <= high);
-    while first < last {
-        // Sessions are in start order, so one day's sessions are contiguous.
-        let next_day = (starts[first].div_euclid(DAY) + 1) * DAY;
-        let end = first + starts[first..last].partition_point(|&s| s < next_day);
-        counts[sessions[first].day][3] += (end - first) as u64;
-        first = end;
+    // A person has few sessions: one pass, no searches or divisions.
+    let mut at = if starts.len() > 32 { starts.partition_point(|&s| s < low) } else { 0 };
+    while at < starts.len() && starts[at] <= high {
+        if starts[at] >= low {
+            counts[sessions[at].day][3] += 1;
+        }
+        at += 1;
     }
 }
 
