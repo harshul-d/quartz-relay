@@ -2,6 +2,34 @@ READY TO SUBMIT: v10 fa8f1c12320a4e62972cd0d17c997160c284551a (Actions, 20M, war
 
 # Progress
 
+## Report (structural phase, written after the fused-parse rewrite was benchmarked)
+**Where we are.** Tags v9 and v10 are verified wins on Actions; v10 is READY. Since then: no new tag (every candidate was under 20%, which the scorer's ±20% machine spread cannot confirm; v10 scored 1.54 s vs v8's 1.39 s there). HEAD = v10 + parallel link filter + hash reuse + unchecked unquoting, about 3% less CPU than v10.
+
+**CPU and wall per version** (Actions, 20M, run 0a8db5f, all four in the same job; native warm under `/usr/bin/time`, 4 threads):
+
+| Runner | | v8 | v9 | v10 | HEAD |
+| --- | --- | --- | --- | --- | --- |
+| EPYC 7763 | CPU-s (user+sys) | 7.23 | 6.95 | 6.62 | 6.44 |
+| | container warm wall | 2.091 | 1.968 | 1.898 | 1.831 |
+| EPYC 7763 | CPU-s | 7.43 | 7.14 | 6.82 | 6.64 |
+| | container warm wall | 2.128 | 2.006 | 1.940 | 1.880 |
+| EPYC 9V74 | CPU-s | 6.31 | 6.01 | 5.74 | 5.66 |
+| | container warm wall | 2.138 | 1.822 | 1.678 | 1.786 (noisy) |
+
+Single-thread CPU (EPYC 7763): v8 4.76 s, HEAD 4.25 s (-11%). The budget for 0.30 s on 8 vCPUs is about 2 CPU-s: we are at 2.1-2.4x that even single-threaded, and hyperthreads inflate it a further ~1.5x.
+
+**What scaled** (native, 1 -> 2 -> 4 threads on 2 cores x 2 hyperthreads; HEAD, EPYC 7763): every phase scales ~1.9x from 1 to 2 threads (two cores) and ~1.3x more on hyperthreads. Events parse 2.18 / 1.12 / 0.89 s (2.45x), sessionize 1.29 / 0.66 / 0.45 (2.86x), clicks 0.38 / 0.19 / 0.15 (2.6x), dedup 0.19 / 0.10 / 0.07 (2.7x), ID linking 0.19 / 0.11 / 0.09 (2.1x, the worst), lookups 0.011 (serial but tiny). No phase is serial enough to matter on 4 cores: the gap is total work, not scaling.
+
+**What did not work** (measured): mmap in four variants (no wall gain, -0.1 CPU-s of sys), dedup/clicks overlap (worse), streaming non-temporal partition writes (no gain), a flattening tokenizer (slower), and the fused tokenize+decode parse for events and clicks (slightly slower; per-field dispatch costs what the span arrays did). The tokenizer itself already runs at ~1.8 GB/s per physical core; the earlier "250 MB/s" note was a miscalculation (corrected below).
+
+**Why the teammate pipeline is faster:** see the next section. In short, it recognizes the generator's ID encoding, turns IDs into dense integers, and so writes each event once (20-byte records), dedups with an array and groups people without hashing, which removes about two of our full passes over memory and nearly all hashing. Its general path is structurally like ours.
+
+**Next, ranked:**
+1. **Dense-ID fast path** (teammate idea 1): recover the generator's per-seed user and event scramble keys from data pairs, decode IDs to integers, shard copies by event number (array dedup, L2-resident), finish people whose events all land in one shard without hashing, route everyone else (whales, shared devices, cross-shard people, IDs that do not decode) to today's general path. Exact for any input. Expected: the largest CPU cut available (the teammate is ~30% faster on the scorer with it). Cost: a large change (key recovery with tests against the generator's known keys, a second pipeline, fallbacks); it relies on the generator's internal ID scheme, which is a deliberate choice to make.
+2. **8-byte keys** (teammate idea 2): IDs of up to 9 ASCII bytes packed 7 bits per byte into a `u64`, `u128` as a whole-run fallback. Records shrink 32 -> 24 bytes (events, copies) and 48 -> 24-32 (clicks); hashes and compares halve. Expected ~10-15% CPU; generic, no data assumptions.
+3. **PLAIN output again**: the scorer's disk looks fast (the teammate writes 90 MB of PLAIN Parquet and scores 1.04 s), and our dictionary encoding costs ~0.1 CPU-s single-threaded (sessionize 1.16 -> 1.29 s since v8, output 0.08 -> 0.00). Keep it only if the scorer's disk is slow.
+4. **Sessionize** (29% of CPU): a dense-id path (1) removes the grouping hash and counting sort; without it, the per-person sort of 32-byte records (~5% of CPU) and attribution's `counts` cache misses are next.
+
 ## Comparison with the teammate pipeline (scorer: 1.04 s; ours v8 1.39 s, v10 1.54 s)
 Read in full from a clone outside this repo (`../teammate/`). Scorer numbers differ by up to ±20% per machine, so v10's Actions gains (under 20%) are unproven on the scorer. Differences, ranked by likely impact:
 
