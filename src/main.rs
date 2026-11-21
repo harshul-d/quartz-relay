@@ -31,6 +31,13 @@ use std::time::Instant;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+unsafe extern "C" {
+    /// From the statically linked mimalloc (mimalloc.h).
+    fn mi_option_set(option: i32, value: std::ffi::c_long);
+}
+/// `mi_option_purge_delay` in mimalloc 2.x's `mi_option_e`.
+const MI_OPTION_PURGE_DELAY: i32 = 15;
+
 use csv::{Files, for_each_line, for_each_record, split};
 use key::{FastMap, Interner, Key, Strings, hash};
 use ts::{DAY, HOUR, MINUTE};
@@ -123,6 +130,10 @@ struct Window {
 }
 
 fn main() {
+    // A short-lived batch job: never hand freed memory back to the OS, so the
+    // next big allocation reuses already-faulted pages.
+    // SAFETY: plain FFI call with valid arguments, before any threads start.
+    unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
     let begin = Instant::now();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
