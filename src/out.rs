@@ -149,15 +149,39 @@ struct Dictionary {
     values: Vec<u8>,
     count: u32,
     indices: Vec<u32>,
-    /// Open addressing: (key, 1 + index), 0 = empty.
+    /// Keys `base..base + DIRECT` map through `direct` (1 + index, 0 = none):
+    /// counts, days, zero revenue and category numbers almost all land here.
+    base: u64,
+    direct: Vec<u32>,
+    /// Other keys, open addressing: (key, 1 + index), 0 = empty.
     slots: Vec<(u64, u32)>,
 }
 
+const DIRECT: u64 = 4096;
+
 impl Dictionary {
+    fn based(base: u64) -> Dictionary {
+        Dictionary { base, direct: vec![0; DIRECT as usize], ..Dictionary::default() }
+    }
+
     /// The index of the value identified by `key`; a new value's PLAIN bytes
     /// are appended by `fill`.
     #[inline]
     fn index_of(&mut self, key: u64, fill: impl FnOnce(&mut Vec<u8>)) -> u32 {
+        let offset = key.wrapping_sub(self.base);
+        if offset < DIRECT && !self.direct.is_empty() {
+            let held = self.direct[offset as usize];
+            if held != 0 {
+                return held - 1;
+            }
+            self.direct[offset as usize] = self.count + 1;
+            return self.add(fill);
+        }
+        self.index_hashed(key, fill)
+    }
+
+    #[inline]
+    fn index_hashed(&mut self, key: u64, fill: impl FnOnce(&mut Vec<u8>)) -> u32 {
         if self.count as usize * 2 >= self.slots.len() {
             self.grow();
         }
@@ -257,6 +281,10 @@ fn varint_len(value: u64) -> usize {
 impl ColumnData {
     fn dictionary() -> ColumnData {
         ColumnData { dict: Some(Dictionary::default()), ..ColumnData::default() }
+    }
+    /// A dictionary column whose keys mostly lie in `base..base + 4096`.
+    fn dictionary_from(base: u64) -> ColumnData {
+        ColumnData { dict: Some(Dictionary::based(base)), ..ColumnData::default() }
     }
     fn dict(&mut self) -> &mut Dictionary {
         self.dict.as_mut().expect("a dictionary column")
@@ -548,7 +576,15 @@ pub fn write_user_daily(path: &Path, rows: &[UserDay], lookups: &Lookups, string
             writer.row_group(&USER_DAILY, &columns, group.len());
             continue;
         }
-        let mut columns: Vec<ColumnData> = (0..USER_DAILY.len()).map(|_| ColumnData::dictionary()).collect();
+        let first_day = group.first().map_or(0, |row| row.day as u32 as u64);
+        let mut columns: Vec<ColumnData> = vec![
+            ColumnData::dictionary(),
+            ColumnData::dictionary_from(first_day),
+            ColumnData::dictionary_from(0),
+            ColumnData::dictionary_from(0),
+            ColumnData::dictionary_from(0),
+            ColumnData::dictionary_from(0),
+        ];
         let mut previous = None;
         for row in group {
             // A person's rows are adjacent: one dictionary entry per run.
