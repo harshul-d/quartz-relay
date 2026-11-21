@@ -33,7 +33,7 @@ READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: links p
 ### Phase 2: Rust pipeline (done, tag v1)
 1. Fixtures 36/36 (`python scripts/run_fixtures.py fixtures -- target/release/shopping-sessions.exe`).
 2. Dev set: exact MATCH with dev-answer.
-3. Differential: `scripts/diff_test.py`, 13 datasets (seeds 2-12 at 200k-2M events, seeds 15 and 249 whose windows hold 2028-02-29; 249's last day is Feb 29): ALL MATCH.
+3. Differential: `scripts/diff_test.py`, 13 datasets (now 15 with two long-ID variants) (seeds 2-12 at 200k-2M events, seeds 15 and 249 whose windows hold 2028-02-29; 249's last day is Feb 29): ALL MATCH.
    Plus unit tests: timestamp/price forms, CSV dialect, and a randomized brute-force check of credit and assists (3,000 cases).
 4. Docker: not available locally; Dockerfile reviewed (see Decisions).
 5. Local timings (this laptop, warm-ish cache, NCPU unset = 8 threads):
@@ -43,6 +43,8 @@ READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: links p
 ### Phase 3: speed (in progress)
 - Finding: on Windows, first-touch page faults of memory-mapped input cost ~2.5 s for 1.6 GB (scan itself 0.08 s); positional reads into a reused per-thread buffer take ~0.6 s. Linux faults are far cheaper, but pread is predictable on both and was adopted.
 - Finding: link maps grew by rehashing (0.5 s); replaced by a partitioned open-addressing table built in parallel, plus a bitset filter in front of the person lookup.
+- Scale cross-check (v7): the current build and v1 (an independent implementation: mmap, sort-based dedup and grouping, sequential union-find) agree exactly on 20M (2,245,672 user_daily rows) and 60M (6,614,475 rows). 60M with v7: 16.0 s on this loaded laptop, peak private 5.8 GiB.
+- Long IDs: `scripts/make_long_ids.py` lengthens a deterministic third of all IDs past 15 bytes (sharing prefixes with short ones). The differential suite now has 15 cases (13 generated + 2 long-ID variants), all MATCH.
 - v7: union by key order makes every root its set's smallest ID (no separate pass); the union-find itself runs in parallel (CAS linking of the larger-key root under the smaller; path halving). Stress test: random link files with long chains, stars, repeats, self-links and long IDs vs a sequential union-find, 30/30 repeated runs pass. Links phase 0.43-0.48 s -> 0.30-0.34 s in A/B. Unquoting is branchless (random 20% quoting made the branch mispredict).
 - v6: the person lookup was the biggest single parse cost (skipping it: 19 s -> 10 s single-threaded parse). Each hit took three dependent cache misses (slot, key, name) and the scatter writes evict the filter and table. Now: flat (key, name) slots (one miss per hit) and rows resolved in batches of 32 with software prefetch of filter word, then slot. A/B: 3.05 -> 2.72 (flat) -> 2.38 s (batched); CPU 15.7 -> 11.8 s. Partitions are processed largest-first in dedup and sessionize (whale persons).
 - v5: mimalloc `purge_delay = -1` set at startup via `mi_option_set` (kernel CPU time -1.5 s per 20M run here: freed pages are reused instead of re-faulted). 60M peak private memory 8.2 GiB with it (was 7.1). Grouping: custom dense-id table, id stored in the record, no zero-fill; group-events cost -25% relative.

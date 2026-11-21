@@ -34,6 +34,9 @@ CASES = [
     (11, 2_000_000), (12, 250_000), (15, 1_000_000), (249, 400_000),
 ]
 QUICK = [(2, 200_000), (249, 400_000), (15, 1_000_000)]
+# Variants with a third of all IDs lengthened past 15 bytes (scripts/make_long_ids.py),
+# for the pipeline's interned long-ID path.
+LONG = [(2, 200_000), (12, 250_000)]
 
 
 def generate(generator, seed, events, folder):
@@ -85,10 +88,17 @@ def main():
     data_root = Path(args.data).resolve()
     data_root.mkdir(parents=True, exist_ok=True)
     failures = []
-    for seed, events in (QUICK if args.quick else CASES):
+    cases = [(seed, events, False) for seed, events in (QUICK if args.quick else CASES)]
+    cases += [(seed, events, True) for seed, events in LONG]
+    for seed, events, long_ids in cases:
         name = f"diff-s{seed}-e{events}"
         data = data_root / name
         generate(args.generator, seed, events, data)
+        if long_ids:
+            name = f"long-s{seed}-e{events}"
+            source, data = data, data_root / name
+            if not (data / "manifest.json").is_file():
+                subprocess.run([sys.executable, str(HERE / "make_long_ids.py"), str(source), str(data)], check=True)
         ref_out = data_root / (name + "-ref")
         if not (ref_out / "done").is_file():
             seconds = run([sys.executable, str(REPO / "reference" / "reference.py")], data, ref_out)
