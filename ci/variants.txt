@@ -1,6 +1,6 @@
 # name  git-ref  [KEY=VALUE ...]  (extra container environment for flag-gated experiments;
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
-v8    v8
-v9    v9
-head  HEAD
+v10     v10
+filter  d7d44f0
+head    HEAD
