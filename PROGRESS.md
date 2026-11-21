@@ -1,4 +1,4 @@
-READY TO SUBMIT: v1 4df5c9cb68624e4a91bdaf57228e62da13f15639
+READY TO SUBMIT: v2 dedb3efb90a14403ebaf6c8b197cf59f4f0ccba4 (local 20M: 4.5 s under heavy outside CPU load; v1 7.5 s under the same load)
 
 # Progress
 
@@ -41,11 +41,17 @@ READY TO SUBMIT: v1 4df5c9cb68624e4a91bdaf57228e62da13f15639
    - 60M (seed 102): 44-47 s, peak private 7.6 GiB, peak working set 8.0 GiB. The 4.7 GB input does not stay cached next to the heap on a 16 GB laptop, so this run is partly disk-bound.
 
 ### Phase 3: speed (in progress)
+- Finding: on Windows, first-touch page faults of memory-mapped input cost ~2.5 s for 1.6 GB (scan itself 0.08 s); positional reads into a reused per-thread buffer take ~0.6 s. Linux faults are far cheaper, but pread is predictable on both and was adopted.
+- Finding: link maps grew by rehashing (0.5 s); replaced by a partitioned open-addressing table built in parallel, plus a bitset filter in front of the person lookup.
+- v2: fixtures 36/36, dev MATCH, differential 13/13 MATCH, unit tests incl. 25k-round tokenizer fuzz against the plain splitter (it caught an unterminated last line ending in an empty field).
 
 ## Timings per tag (20M seed 101, local laptop)
 | Tag | 20M median | 60M | Notes |
 | --- | --- | --- | --- |
 | v1 | 7.8 s | 45.6 s | correct baseline: sort-based dedup, 64-byte records, parquet crate |
+| v2 | 4.5 s* | - | pread into reused buffers, AVX2 tokenizer, hash dedup with tombstones, partitioned link table, mimalloc |
+
+\* From v2 on, another user's 8-process Python job shares this laptop's CPU, so absolute times are inflated and noisy; versions are compared A/B interleaved under the same load (v1 measured 7.3-7.7 s alongside v2).
 
 ## Open ideas
 - Parse: SIMD bitmask scan of `,` `"` `\n` per 64-byte block instead of per-line memchr.
