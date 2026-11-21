@@ -15,10 +15,90 @@ use crate::par;
 const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
 
-/// An open-addressing table from keys to dense ids. A slot holds a 32-bit
-/// fingerprint of the hash and 1 + the id's index within its partition
-/// (0 = empty); a fingerprint match is confirmed by comparing the full key.
+/// The lookup used on every event and click: each linked ID whose name is
+/// another ID, mapped to that name, in one flat open-addressing table of
+/// (key, name) slots, so a hit costs a single cache miss. Slot positions
+/// come from the top hash bits, so partition `p` owns one contiguous slot
+/// range (probing wraps inside it) and the table is built in parallel. A
+/// bitset over the same keys answers most misses without touching it.
 pub struct Names {
+    /// (key, name); key 0 (the empty ID, never linked) marks an empty slot.
+    table: Vec<(Key, Key)>,
+    /// log2 of the table size.
+    table_bits: u32,
+    /// Slots per partition - 1.
+    range_mask: usize,
+    filter: Vec<u64>,
+    filter_mask: u64,
+}
+
+#[inline(always)]
+fn prefetch<T>(item: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint and never faults; the pointer is valid anyway.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(item as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = item;
+}
+
+impl Names {
+    /// The person (name) of a user ID: the ID itself unless a link joins it
+    /// to a byte-wise smaller one. (The pipeline uses the batched steps below.)
+    #[allow(dead_code)]
+    #[inline(always)]
+    pub fn person(&self, user: Key) -> Key {
+        let hashed = hash(user);
+        if !self.may_be_linked(hashed) {
+            return user;
+        }
+        self.resolve(user, hashed)
+    }
+
+    // The three steps of `person`, for batched lookups that overlap their
+    // cache misses: prefetch the filter word, test it and prefetch the table
+    // slot, then resolve.
+
+    #[inline(always)]
+    pub fn prefetch_filter(&self, hashed: u64) {
+        let bit = filter_bit(hashed, self.filter_mask);
+        prefetch(&self.filter[(bit >> 6) as usize]);
+    }
+
+    #[inline(always)]
+    pub fn may_be_linked(&self, hashed: u64) -> bool {
+        let bit = filter_bit(hashed, self.filter_mask);
+        self.filter[(bit >> 6) as usize] & (1 << (bit & 63)) != 0
+    }
+
+    #[inline(always)]
+    pub fn prefetch_slot(&self, hashed: u64) {
+        prefetch(&self.table[(hashed >> (64 - self.table_bits)) as usize]);
+    }
+
+    /// The table lookup itself (`user` hashes to `hashed`).
+    #[inline(always)]
+    pub fn resolve(&self, user: Key, hashed: u64) -> Key {
+        let mut slot = (hashed >> (64 - self.table_bits)) as usize;
+        loop {
+            let (key, name) = self.table[slot];
+            if key == user {
+                return name;
+            }
+            if key == 0 {
+                return user;
+            }
+            slot = (slot & !self.range_mask) | ((slot + 1) & self.range_mask);
+        }
+    }
+}
+
+/// An open-addressing table from keys to dense ids, used while building. A
+/// slot holds a 32-bit fingerprint of the hash and 1 + the id's index within
+/// its partition (0 = empty); a fingerprint match is confirmed by comparing
+/// the full key.
+struct DenseIds {
     /// Slots per partition, a power of two.
     slots_per_partition: usize,
     slots: Vec<u64>,
@@ -26,11 +106,6 @@ pub struct Names {
     bases: Vec<u32>,
     /// Key of each dense id.
     keys: Vec<Key>,
-    /// Person name of each dense id.
-    names: Vec<Key>,
-    /// Bitset over hashes of the ids whose name is another ID.
-    filter: Vec<u64>,
-    filter_mask: u64,
 }
 
 #[inline(always)]
@@ -48,7 +123,7 @@ fn filter_bit(hashed: u64, mask: u64) -> u64 {
     hashed.rotate_left(29) & mask
 }
 
-impl Names {
+impl DenseIds {
     /// The dense id of `key`, if it appears in a link.
     #[inline(always)]
     fn id(&self, key: Key, hashed: u64) -> Option<u32> {
@@ -70,21 +145,6 @@ impl Names {
                 }
             }
             slot = (slot + 1) & mask;
-        }
-    }
-
-    /// The person (name) of a user ID: the ID itself unless a link joins it
-    /// to a byte-wise smaller one.
-    #[inline(always)]
-    pub fn person(&self, user: Key) -> Key {
-        let hashed = hash(user);
-        let bit = filter_bit(hashed, self.filter_mask);
-        if self.filter[(bit >> 6) as usize] & (1 << (bit & 63)) == 0 {
-            return user;
-        }
-        match self.id(user, hashed) {
-            Some(id) => self.names[id as usize],
-            None => user,
         }
     }
 }
@@ -168,15 +228,7 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
         keys.extend_from_slice(part_keys);
     }
     drop(partition_keys);
-    let mut names = Names {
-        slots_per_partition,
-        slots,
-        bases,
-        keys,
-        names: Vec::new(),
-        filter: Vec::new(),
-        filter_mask: 0,
-    };
+    let names = DenseIds { slots_per_partition, slots, bases, keys };
 
     // 3. Translate the pairs to dense ids (in parallel), then union-find
     //    (Linked IDs 2: joining is transitive, repeats and self-links are no-ops).
@@ -224,29 +276,55 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
             smallest[root] = x;
         }
     }
-    let mut person_names: Vec<Key> = Vec::with_capacity(count);
-    let mut linked = 0usize;
-    for x in 0..count as u32 {
-        let root = parent[x as usize] as usize; // fully compressed above
-        let name = names.keys[smallest[root] as usize];
-        linked += (name != names.keys[x as usize]) as usize;
-        person_names.push(name);
-    }
-    names.names = person_names;
+    let person_names: Vec<Key> = (0..count).map(|x| names.keys[smallest[parent[x] as usize] as usize]).collect();
+    drop(smallest);
+    drop(parent);
 
-    // 5. The filter: only IDs named by another ID need the table.
+    // 5. The lookup table: only IDs named by another ID go in. Dense ids are
+    //    grouped by partition, and partition p fills its own slot range.
+    let linked_in = |part: usize| -> std::ops::Range<usize> {
+        let end = names.bases.get(part + 1).map_or(count, |&base| base as usize);
+        names.bases[part] as usize..end
+    };
+    let most = (0..PARTITIONS)
+        .map(|part| linked_in(part).filter(|&x| person_names[x] != names.keys[x]).count())
+        .max()
+        .unwrap_or(0);
+    let range = (most + most / 2 + 1).next_power_of_two().max(2);
+    let table_bits = (range * PARTITIONS).trailing_zeros();
+    let range_mask = range - 1;
+    let mut table: Vec<(Key, Key)> = vec![(0, 0); range * PARTITIONS];
+    {
+        let ranges: Vec<std::sync::Mutex<&mut [(Key, Key)]>> = table.chunks_mut(range).map(std::sync::Mutex::new).collect();
+        par::run(threads, PARTITIONS, |_| (), |_, part| {
+            let mut slots = ranges[part].lock().unwrap();
+            for x in linked_in(part) {
+                let (key, name) = (names.keys[x], person_names[x]);
+                if key == name {
+                    continue;
+                }
+                let mut slot = (hash(key) >> (64 - table_bits)) as usize & range_mask;
+                while slots[slot].0 != 0 {
+                    slot = (slot + 1) & range_mask;
+                }
+                slots[slot] = (key, name);
+            }
+        });
+    }
+
+    // 6. The filter over the same keys.
+    let linked = (0..count).filter(|&x| person_names[x] != names.keys[x]).count();
     let bits = (linked * 16).next_power_of_two().max(1 << 16);
-    names.filter = vec![0u64; bits / 64];
-    names.filter_mask = bits as u64 - 1;
+    let mut filter = vec![0u64; bits / 64];
+    let filter_mask = bits as u64 - 1;
     for x in 0..count {
-        if names.names[x] != names.keys[x] {
-            let bit = filter_bit(hash(names.keys[x]), names.filter_mask);
-            names.filter[(bit >> 6) as usize] |= 1 << (bit & 63);
+        if person_names[x] != names.keys[x] {
+            let bit = filter_bit(hash(names.keys[x]), filter_mask);
+            filter[(bit >> 6) as usize] |= 1 << (bit & 63);
         }
     }
-    names
+    Names { table, table_bits, range_mask, filter, filter_mask }
 }
-
 /// Byte-wise comparison of two keys while the interner is still open.
 fn compare(interner: &Interner, a: Key, b: Key) -> std::cmp::Ordering {
     if !key::is_long(a) && !key::is_long(b) {

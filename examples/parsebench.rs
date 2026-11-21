@@ -5,6 +5,11 @@ mod csv;
 #[path = "../src/key.rs"]
 #[allow(dead_code)]
 mod key;
+#[path = "../src/links.rs"]
+#[allow(dead_code)]
+mod links;
+#[path = "../src/par.rs"]
+mod par;
 #[path = "../src/ts.rs"]
 #[allow(dead_code)]
 mod ts;
@@ -21,7 +26,21 @@ fn main() {
         let s = t.elapsed().as_secs_f64();
         println!("{name:28} {:6.1} ns/row  {:6.0} MB/s", s * 1e9 / rows as f64, data.len() as f64 / s / 1e6);
     };
+    let links_dir = std::path::Path::new(&path).parent().unwrap().parent().unwrap();
+    let t = Instant::now();
+    let names = links::build(links_dir, &interner, 8, 2 << 20);
+    println!("links build {:?}", t.elapsed());
     for _ in 0..2 {
+        let t = Instant::now();
+        let mut n = 0u128;
+        csv::for_each_record::<7>(&data, |f| n = n.wrapping_add(names.person(interner.key(f[1]))));
+        black_box(n);
+        report("tokenize + person", t);
+        let t = Instant::now();
+        let mut hits = 0u64;
+        csv::for_each_record::<7>(&data, |f| { let u = interner.key(f[1]); hits += (names.person(u) != u) as u64; });
+        println!("rows mapped to another name: {:.1}%", hits as f64 * 100.0 / rows as f64);
+        black_box(t);
         let t = Instant::now();
         let mut n = 0u64;
         csv::for_each_record::<7>(&data, |f| n += f[0].len() as u64);

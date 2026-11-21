@@ -289,15 +289,53 @@ fn parse_events(
     // Event lines average ~75 bytes; reserve for a little more rows than that,
     // so the partition buffers almost never grow (and copy).
     let capacity = partition_capacity(files.total_bytes() / 64, threads);
+    /// A valid row waiting for its person: lookups are done in batches so
+    /// their cache misses overlap (see `links::Names`).
+    #[derive(Clone, Copy)]
+    struct Pending {
+        user: Key,
+        event_id: Key,
+        hashed: u64,
+        ingest: i64,
+        ts: i64,
+        price: u32,
+        category: u16,
+        flags: u8,
+        linked: bool,
+    }
+    const BATCH: usize = 32;
     struct State {
         thread: usize,
         people: Vec<Vec<PersonEvent>>,
         copies: Vec<Vec<EventCopy>>,
+        pending: Vec<Pending>,
+    }
+    fn flush(state: &mut State, names: &links::Names) {
+        for row in state.pending.iter_mut() {
+            row.linked = names.may_be_linked(row.hashed);
+            if row.linked {
+                names.prefetch_slot(row.hashed);
+            }
+        }
+        for row in &state.pending {
+            let person = if row.linked { names.resolve(row.user, row.hashed) } else { row.user };
+            let part = partition(person);
+            let buffer = &mut state.people[part];
+            let location = location_of(part, state.thread, buffer.len());
+            buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
+            state.copies[partition(row.event_id)].push(EventCopy { event_id: row.event_id, ingest: row.ingest, location });
+        }
+        state.pending.clear();
     }
     let states = par::run(
         threads,
         chunks.len(),
-        |thread| State { thread, people: sized_partitions(capacity), copies: sized_partitions(capacity) },
+        |thread| State {
+            thread,
+            people: sized_partitions(capacity),
+            copies: sized_partitions(capacity),
+            pending: Vec::with_capacity(BATCH),
+        },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
                 for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
@@ -307,7 +345,6 @@ fn parse_events(
                     let event_id = interner.key(event_id);
                     // ingest_ts is always valid F1; were it not, the copy sorts last.
                     let ingest = ts::parse(ingest_text).unwrap_or(i64::MAX);
-                    let mut location = INVALID;
                     'validate: {
                         if user.is_empty() || product.is_empty() {
                             break 'validate;
@@ -331,18 +368,32 @@ fn parse_events(
                         if ingest.saturating_sub(ts) > LATE_LIMIT {
                             break 'validate;
                         }
-                        let person = names.person(interner.key(user));
-                        let part = partition(person);
-                        let buffer = &mut state.people[part];
-                        location = location_of(part, state.thread, buffer.len());
-                        buffer.push(PersonEvent { person, ts, price, category, flags: if purchase { PURCHASE } else { 0 } });
+                        let user = interner.key(user);
+                        let hashed = hash(user);
+                        names.prefetch_filter(hashed);
+                        state.pending.push(Pending {
+                            user,
+                            event_id,
+                            hashed,
+                            ingest,
+                            ts,
+                            price,
+                            category,
+                            flags: if purchase { PURCHASE } else { 0 },
+                            linked: false,
+                        });
+                        if state.pending.len() == BATCH {
+                            flush(state, names);
+                        }
+                        return;
                     }
-                    state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location });
-                })
+                    // Failed validation: only the dedup copy is kept.
+                    state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                });
+                flush(state, names);
             });
         },
-    );
-    let mut people = Vec::with_capacity(states.len());
+    );    let mut people = Vec::with_capacity(states.len());
     let mut copies = Vec::with_capacity(states.len());
     for state in states {
         people.push(state.people);
@@ -421,23 +472,55 @@ fn parse_clicks(
     let chunks = files.chunks(CHUNK_BYTES);
     // Click lines average ~45 bytes.
     let capacity = partition_capacity(files.total_bytes() / 38, threads);
-    let states = par::run(threads, chunks.len(), |_| sized_partitions::<PersonClick>(capacity), |parts, index| {
-        files.with_chunk(&chunks[index], |bytes| {
-            for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
-                if click_id.is_empty() || user.is_empty() {
-                    return;
-                }
-                let Some(ts) = ts::parse(ts_text) else { return };
-                if ts < window.click_start || ts >= window.end {
-                    return;
-                }
-                let Some(&campaign) = lookups.campaigns.get(&interner.key(campaign)) else { return };
-                let person = names.person(interner.key(user));
-                parts[partition(person)].push(PersonClick { person, click_id: interner.key(click_id), ts, campaign });
-            })
-        });
-    });
-    transpose(states)
+    struct State {
+        parts: Vec<Vec<PersonClick>>,
+        pending: Vec<(PersonClick, u64, bool)>, // click with its user in `person`, user hash, linked
+    }
+    const BATCH: usize = 32;
+    fn flush(state: &mut State, names: &links::Names) {
+        for (_, hashed, linked) in state.pending.iter_mut() {
+            *linked = names.may_be_linked(*hashed);
+            if *linked {
+                names.prefetch_slot(*hashed);
+            }
+        }
+        for &(mut click, hashed, linked) in &state.pending {
+            if linked {
+                click.person = names.resolve(click.person, hashed);
+            }
+            state.parts[partition(click.person)].push(click);
+        }
+        state.pending.clear();
+    }
+    let states = par::run(
+        threads,
+        chunks.len(),
+        |_| State { parts: sized_partitions::<PersonClick>(capacity), pending: Vec::with_capacity(BATCH) },
+        |state, index| {
+            files.with_chunk(&chunks[index], |bytes| {
+                for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
+                    if click_id.is_empty() || user.is_empty() {
+                        return;
+                    }
+                    let Some(ts) = ts::parse(ts_text) else { return };
+                    if ts < window.click_start || ts >= window.end {
+                        return;
+                    }
+                    let Some(&campaign) = lookups.campaigns.get(&interner.key(campaign)) else { return };
+                    let user = interner.key(user);
+                    let hashed = hash(user);
+                    names.prefetch_filter(hashed);
+                    let click = PersonClick { person: user, click_id: interner.key(click_id), ts, campaign };
+                    state.pending.push((click, hashed, false));
+                    if state.pending.len() == BATCH {
+                        flush(state, names);
+                    }
+                });
+                flush(state, names);
+            });
+        },
+    );
+    let states: Vec<Vec<Vec<PersonClick>>> = states.into_iter().map(|state| state.parts).collect();    transpose(states)
 }
 
 /// Results of one thread's share of the sessionizing.
