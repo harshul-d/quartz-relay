@@ -54,7 +54,13 @@ const CHUNK_BYTES: u64 = 2 << 20;
 
 #[inline(always)]
 fn partition(key: Key) -> usize {
-    (hash(key) >> (64 - PARTITION_BITS)) as usize
+    partition_of_hash(hash(key))
+}
+
+/// `partition(key)` given `hash(key)`.
+#[inline(always)]
+fn partition_of_hash(hashed: u64) -> usize {
+    (hashed >> (64 - PARTITION_BITS)) as usize
 }
 
 /// A surviving-so-far event in its person's partition.
@@ -332,8 +338,13 @@ fn parse_events(
             }
         }
         for row in &state.pending {
-            let person = if row.linked { names.resolve(row.user, row.hashed) } else { row.user };
-            let part = partition(person);
+            // An unlinked user is its own person: its hash is already known.
+            let (person, part) = if row.linked {
+                let person = names.resolve(row.user, row.hashed);
+                (person, partition(person))
+            } else {
+                (row.user, partition_of_hash(row.hashed))
+            };
             let buffer = &mut state.people[part];
             let location = location_of(part, state.thread, buffer.len());
             buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
@@ -501,10 +512,13 @@ fn parse_clicks(
             }
         }
         for &(mut click, hashed, linked) in &state.pending {
-            if linked {
+            let part = if linked {
                 click.person = names.resolve(click.person, hashed);
-            }
-            state.parts[partition(click.person)].push(click);
+                partition(click.person)
+            } else {
+                partition_of_hash(hashed)
+            };
+            state.parts[part].push(click);
         }
         state.pending.clear();
     }
