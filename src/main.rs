@@ -50,7 +50,13 @@ const LOOKBACK: i64 = 7 * DAY;
 /// Records are spread over this many hash partitions (a power of two).
 const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
-const CHUNK_BYTES: u64 = 2 << 20;
+/// Input chunk size; `PIPELINE_CHUNK_KB` overrides it for A/B runs.
+fn chunk_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("PIPELINE_CHUNK_KB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&kb| kb >= 16).map_or(2 << 20, |kb| kb << 10)
+    })
+}
 
 #[inline(always)]
 fn partition(key: Key) -> usize {
@@ -159,7 +165,7 @@ fn main() {
     let lookups = read_lookups(&data, &interner);
     log("lookups");
 
-    let names = links::build(&data, &interner, threads, CHUNK_BYTES);
+    let names = links::build(&data, &interner, threads, chunk_bytes());
     log("links");
 
     let events = parse_events(&data, &interner, &names, &lookups, &window, threads);
@@ -305,7 +311,7 @@ fn parse_events(
 ) -> ParsedEvents {
     let skip: u8 = std::env::var("PIPELINE_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let files = Files::open_folder(&data.join("events"));
-    let chunks = files.chunks(CHUNK_BYTES);
+    let chunks = files.chunks(chunk_bytes());
     // Event lines average ~75 bytes; reserve for a little more rows than that,
     // so the partition buffers almost never grow (and copy).
     let capacity = partition_capacity(files.total_bytes() / 64, threads);
@@ -511,7 +517,7 @@ fn parse_clicks(
     threads: usize,
 ) -> Partitioned<PersonClick> {
     let files = Files::open_folder(&data.join("clicks"));
-    let chunks = files.chunks(CHUNK_BYTES);
+    let chunks = files.chunks(chunk_bytes());
     // Click lines average ~45 bytes.
     let capacity = partition_capacity(files.total_bytes() / 38, threads);
     struct State {
