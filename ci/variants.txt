@@ -1,6 +1,9 @@
 # name  git-ref  [KEY=VALUE ...]  (extra container environment for flag-gated experiments;
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
-v10     v10
-filter  d7d44f0
-head    HEAD
+# Cost attribution only: PIPELINE_SKIP variants produce wrong output on purpose.
+head          HEAD
+skip-copies   HEAD  PIPELINE_SKIP=1
+skip-scatter  HEAD  PIPELINE_SKIP=3
+skip-flush    HEAD  PIPELINE_SKIP=4
+skip-rows     HEAD  PIPELINE_SKIP=8
