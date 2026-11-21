@@ -32,11 +32,19 @@ CASES = [
     (2, 200_000), (3, 300_000), (4, 400_000), (5, 500_000), (6, 600_000),
     (7, 750_000), (8, 1_000_000), (9, 1_250_000), (10, 1_500_000),
     (11, 2_000_000), (12, 250_000), (15, 1_000_000), (249, 400_000),
+    (13, 20_000), (14, 35_000), (16, 60_000), (17, 100_000), (18, 150_000),
+    (19, 350_000), (20, 450_000), (21, 900_000), (22, 1_750_000), (23, 2_250_000),
+    (24, 2_600_000), (25, 3_000_000),
 ]
 QUICK = [(2, 200_000), (249, 400_000), (15, 1_000_000)]
 # Variants with a third of all IDs lengthened past 15 bytes (scripts/make_long_ids.py),
 # for the pipeline's interned long-ID path.
 LONG = [(2, 200_000), (12, 250_000)]
+# User IDs rewritten by scripts/make_adversarial.py so they leave the generator's
+# canonical form (all, a tenth) or gain upper-case and space-padded variants.
+# Full mode only: (mode, seed, events).
+ADVERSARIAL = [(mode, seed, events) for mode in ("all", "tenth", "variants")
+               for seed, events in ((2, 200_000), (12, 250_000))]
 
 
 def generate(generator, seed, events, folder):
@@ -88,17 +96,28 @@ def main():
     data_root = Path(args.data).resolve()
     data_root.mkdir(parents=True, exist_ok=True)
     failures = []
-    cases = [(seed, events, False) for seed, events in (QUICK if args.quick else CASES)]
-    cases += [(seed, events, True) for seed, events in LONG]
-    for seed, events, long_ids in cases:
+    cases = [(seed, events, None) for seed, events in (QUICK if args.quick else CASES)]
+    cases += [(seed, events, "long") for seed, events in LONG]
+    if not args.quick:
+        cases += [(seed, events, mode) for mode, seed, events in ADVERSARIAL]
+    for seed, events, kind in cases:
         name = f"diff-s{seed}-e{events}"
         data = data_root / name
         generate(args.generator, seed, events, data)
-        if long_ids:
+        if kind == "long":
             name = f"long-s{seed}-e{events}"
             source, data = data, data_root / name
             if not (data / "manifest.json").is_file():
                 subprocess.run([sys.executable, str(HERE / "make_long_ids.py"), str(source), str(data)], check=True)
+        elif kind:
+            name = f"adv-{kind}-s{seed}-e{events}"
+            source, data = data, data_root / name
+            if not (data / "manifest.json").is_file():
+                tmp = data.with_name(name + ".tmp")
+                subprocess.run([sys.executable, str(HERE / "make_adversarial.py"), str(source), str(tmp),
+                                "--mode", kind, "--seed", str(seed)], check=True, stdout=subprocess.DEVNULL)
+                shutil.rmtree(data, ignore_errors=True)
+                tmp.rename(data)
         ref_out = data_root / (name + "-ref")
         if not (ref_out / "done").is_file():
             seconds = run([sys.executable, str(REPO / "reference" / "reference.py")], data, ref_out)

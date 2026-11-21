@@ -1,0 +1,17 @@
+[package]
+name = "genkeys"
+version = "0.1.0"
+description = "Prints the per-seed ID keys the dataset generator draws, using the generator's own plan code."
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+# Standalone: not part of the pipeline's (or the generator's) build.
+[workspace]
+
+[[bin]]
+name = "genkeys"
+path = "src/main.rs"
+
+[profile.release]
+debug = false

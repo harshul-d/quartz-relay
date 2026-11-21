@@ -100,7 +100,7 @@ jobs:
       - name: Benchmark
         run: |
           python ci/bench.py --data "$DATA/big" --variants ci/variants.txt --work /home/runner/bench-work \
-            --report /tmp/report.md --reps 5
+            --report /tmp/report.md --reps 5 --scaling "$(cat ci/scaling.txt 2>/dev/null)"
           cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Profile (HEAD, native, warm)

@@ -1,6 +1,27 @@
-READY TO SUBMIT: v10 fa8f1c12320a4e62972cd0d17c997160c284551a (Actions, 20M, warm container median in one job, v10 vs v8: 1.906 s vs 2.075 on EPYC 7763, 2.156 vs 2.684 on Xeon 8573C, 1.276 vs 1.746 on EPYC 9V45; v9 in the same job 1.983 / 2.333 / 1.430; v8 scored 1.39 s on the scorer)
+READY TO SUBMIT: v11 TAGSHA (Actions, 20M, same job, warm container median v11 vs v10: 1.685 s vs 2.012 on EPYC 7763, 1.343 vs 1.590 on Xeon 6975P, 1.069 vs 1.327 on EPYC 9V45; CPU-s 5.71 vs 7.10, 4.69 vs 5.72, 3.50 vs 4.76; v10 scored 1.54 s and v8 1.39 s on the scorer)
 
 # Progress
+
+## Report: v11, the fast path for generator-format IDs
+**Tagged v11** (same code as a7fbed1; benchmarked in run a7fbed1 against v10 in the same job, 20M, 4 vCPUs):
+
+| Runner | CPU-s v10 -> v11 (native, user+sys) | Container warm wall | Container cold wall |
+| --- | --- | --- | --- |
+| EPYC 7763 | 7.10 -> **5.71** (-20%) | 2.012 -> **1.685** (-16%) | 5.119 -> 4.992 |
+| Xeon 6975P | 5.72 -> **4.69** (-18%) | 1.590 -> **1.343** (-16%) | 3.494 -> 3.329 |
+| EPYC 9V45 | 4.76 -> **3.50** (-26%) | 1.327 -> **1.069** (-19%) | 5.107 -> 5.001 |
+
+The first fast-path build (F1) alone was -15 to -17% CPU in an earlier job; the refinements in F2 add 3-6%. Cold runs are dominated by reading 1.9 GB from disk and barely move.
+
+**How much took the fast path** (20M, seed 101): 21.19M event rows; only 123 event IDs and 106 valid rows' user IDs did not decode. Of 19.55M surviving events, 17.61M (90%) were finished on the fast path and 1.95M went to the general path: the five whales (several shards each), shared-device people, people at a shard edge, people whose events another person's revised copies interrupt, and long alias chains. Clicks: 4.83M of 5.11M valid (95%) fast. At 60M: 51.9M of 58.7M events (88%), 14.4M of 15.3M clicks (94%).
+
+**Correctness** (all on this code): unit tests in release and debug mode (14, including scramble round trip, encoder against the generator's code, SWAR decoder against the scalar one, synthetic key recovery); key recovery against the generator's true keys on 22 seeds (20k-3M events) 22/22 exact; fixtures 36/36; dev answer MATCH (fast path on and off); differential suite 33/33 (25 seeds of different sizes, 2 long-ID, 6 adversarial: all user IDs remapped, a tenth remapped, added upper-case/space-padded variants; the last two mix both paths in one run); 20M and 60M exact match with v1; Linux fixtures and dev answer in all three Actions shards; pyarrow/DuckDB read the output identically. Peak private memory: 1.65 GiB at 20M, 4.7 GiB at 60M (v1: 2.5 / 7.6 GiB; F1 measured 1.37 / 3.43 before link classification moved alongside event parsing). If key recovery fails or under half the IDs decode, the whole run takes the general path, which measured faster than v10 (`general` variant: 5.55 vs 5.71, 6.56 vs 6.72, 5.52 vs 5.68 CPU-s).
+
+**Next, ranked:**
+1. Event parsing is now about half of all CPU: tokenizer ~15%, timestamps and ID decoding ~10%, the 20-byte scatter ~4%. A line splitter that cuts all 7 fields from one 64-byte mask (no per-separator walk) and an F1 timestamp parser in vector registers are the remaining large items.
+2. Fewer general-path people: whales and shard-edge people could be finished across neighbouring shards (a second pass over runs that touch a shard edge) instead of hashing them; worth ~10% of events.
+3. 8-byte keys for the general path (now ~10% of events), and 24-byte local click records (click_id as its scrambled number, byte order compared only on ts ties).
+4. Memory: peak rose with the overlapped link classification; if the scorer's memory limit is tight, run it before event parsing (costs ~0.03 s).
 
 ## Report (structural phase, written after the fused-parse rewrite was benchmarked)
 **Where we are.** Tags v9 and v10 are verified wins on Actions; v10 is READY. Since then: no new tag (every candidate was under 20%, which the scorer's ±20% machine spread cannot confirm; v10 scored 1.54 s vs v8's 1.39 s there). HEAD = v10 + parallel link filter + hash reuse + unchecked unquoting, about 3% less CPU than v10.
@@ -145,6 +166,37 @@ v10 phases, container warm (EPYC 7763 / Xeon 8573C / EPYC 9V45): lookups 0.011 /
 | H17 | `emit` without bounds checks (indices from the tokenizer's invariants, `debug_assert`ed; debug-mode tests added to `scripts/verify.ps1`, which also caught an overflow in a test's own input generator) | a863bec vs 88429c2: events parse 0.808 -> 0.774 / 1.083 -> 1.024 / 0.664 -> 0.636; warm 1.640 -> 1.618 (EPYC 9V74), 2.195 -> 2.123 (Xeon 8573C, beyond spread), 1.374 -> 1.359 (EPYC 9V45) | Kept |
 | H18 | Chunks of 4 MB / 8 MB (cold reads) | a863bec: cold 4 MB vs 2 MB 8.851 vs 8.900 (Xeon 8573C, just beyond spread), 5.048 vs 5.109 (EPYC 9V45, overlap), EPYC 9V74 too noisy; warm neutral or worse (8 MB 2.180 vs 2.123) | Rejected: 2 MB stays |
 | H19 | Partition scatter with write-combining: pair records per partition in an L1 staging slot and write each 64-byte pair with non-temporal stores (no read-for-ownership of ~1.3 GB); profile: the two scatter writes were 51% of `flush`, ~8% of all CPU. `PIPELINE_NT=0` = plain pushes | b0149c8, events parse streaming vs plain: EPYC 7763 0.926 vs 0.923, EPYC 9V74 0.746 vs 0.747, EPYC 9V45 0.548 vs 0.568 | Rejected (no clear gain), reverted. The set H13+H14+H17 (plain pushes) vs v10 in the same run: events parse 0.990 -> 0.923, 0.798 -> 0.747, 0.614 -> 0.568; warm 2.028 -> 1.930, 1.810 -> 1.767, 1.271 -> 1.238 (beyond spread) |
+
+### Fast path for generator-format IDs (`src/fast.rs`, decided 2026-11-21)
+Adopted the teammate pipeline's idea 1 in our own design. Source of truth for the ID scheme: `tools/gen/src/text.rs` (`scramble`, `base36`), `user.rs` and `plan.rs`; the teammate pipeline was only a second reference.
+
+**Which IDs are encoded** (from the generator source):
+- `user_id` = `u` + base 36 of `scramble(person * 512 + alias, user_key)`; shared devices use numbers from 2^39. Decoded.
+- `event_id` = `e` + base 36 of `scramble(event_index, event_key)`; one person's events have consecutive indexes in time order. Decoded.
+- `click_id` = `k` + base 36 of `scramble(click_index, click_key)`. Not decoded: clicks need the byte-wise click_id for the credit tie-break, copies already meet in their person's list, and there is no click dedup pass to remove.
+- `product_id` = `p` + decimal, `campaign_id` = `c_` + decimal: plain numbers, no key. `src/direct.rs` answers both lookups by array index for canonical spellings (no leading zero) and falls back to the hash map for everything else; built from the finished maps, so first/last-row rules are unchanged. Removes a hash per click and per purchase.
+- Keys: `scramble` is `((v * A) ^ key) & (2^40-1)`, xor-shift 17, `* B`; A and B fixed, the key drawn per seed (only its low 40 bits matter). They depend on the seed alone (draws 6-8 of the dataset stream).
+
+**Design** (choices made):
+- Keys are recovered at run time from samples: the first 8,192 link pairs (two linked IDs are usually one person's, numbers at most 8 apart) for the user key, then event pairs of one person in rows from the start of up to 96 chunks (numbers at most 64 apart) for the event key. Key bits come from the borrow pattern of `x1 - x2 = A*d` (`pair_bits`), grown from a seed pair and scored on up to 2,048 sampled IDs. Nothing about a dataset is hard-coded.
+- An ID is decoded only if it is the prefix plus canonical lowercase base 36 (1-8 digits, no leading zero, below 2^40). That is exactly the set of strings that re-encoding the decoded number gives back, so a number stands for one string. Upper-case, padded, quoted-away or foreign IDs never decode.
+- The run uses the general path from the start when a key is not recovered (score under 0.5; a wrong key scores ~0), or fewer than half the sampled event IDs or user IDs decode, or a guard fails (window over 2^32 ms, over 255 categories, over 32 threads, an ingest_ts that is not whole seconds near the window, which rules.md says never happens). `PIPELINE_FAST=0` forces it for A/B.
+- Events: every copy becomes one 20-byte record (event number, ingest seconds, ts offset, user number or a reference to an undecoded user's key, price | category) in the shard of its event number (2^16 numbers per shard). Dedup is an array per shard (smallest ingest_ts wins; equal ones are identical copies by rules.md). Copies whose event_id does not decode are deduplicated by key.
+- Survivors come out in number order, so a person's events are one run. A person (`person = number >> 9`) is finished in its shard only if all its surviving events form exactly one run there and it is simple: its linked aliases are all in one link set holding nothing but its own aliases (all below 64). Its events are grouped by person key (the set's root for a linked alias, else the user number), so unlinked aliases stay separate persons. Names: the root's key (the set's smallest ID, as the union-find already computes) or the re-encoded ID itself.
+- Everyone else goes to the unchanged general `sessionize` under the name `links::Names` gives: undecoded users, people split over two shards or two runs (event revisions to another person do this), people with an odd event ID, shared devices, upper-cased link variants, chains with many aliases. Clicks follow the same rule through one prefetched lookup (`home`).
+- Link classification runs on one extra thread while the others parse events (only clicks need it).
+
+**Tests added:**
+- Unit: scramble round trip, `encode` against the generator's own scramble/base36, the SWAR decoder against the scalar one on 300k random strings at every chunk position, key recovery on 20 synthetic keys.
+- `tools/genkeys` (the generator's own `plan.rs`) prints each seed's true keys; `scripts/key_test.py` checks recovery on 22 seeds from 20k to 3M events: **22/22 exact** (both keys).
+- Differential suite extended to 33 cases (25 seeds from 20k to 3M events, 2 long-ID, 6 adversarial from `scripts/make_adversarial.py`: every user ID remapped to non-generator strings, a tenth remapped, and added upper-case/space-padded variants with links back): **33/33 MATCH**. The `all` cases switch the fast path off (no user key); `tenth` and `variants` run both paths in one run (seed 2 variants: 97,720 events fast, 99,930 general).
+- 20M and 60M against v1 (independent implementation): **exact match**; peak private 1.37 GiB (20M) and 3.43 GiB (60M), vs 2.5 / 7.6 GiB for v1. At 20M, 17.6M of 19.6M surviving events and 4.83M of 5.11M valid clicks took the fast path.
+- Fixtures 36/36 (their IDs are not generator-format: general path), dev answer MATCH with the fast path on and off.
+
+| # | Change | Result | Decision |
+| --- | --- | --- | --- |
+| F2 | Link classification on its own thread during event parsing; complex persons folded into `home` so a click needs one lookup, prefetched 16 clicks ahead; ingest seconds by unsigned division (a7fbed1). A/B in the same job: 2^17 and 2^18 events per shard (`PIPELINE_SHARD_BITS`), PLAIN output | CPU-s v10 / F1 / F2 / s17 / s18 / plain: EPYC 7763 7.10 / 5.92 / **5.71** / 5.74 / 5.70 / 5.76; Xeon 6975P 5.72 / 4.88 / **4.69** / 4.66 / 4.60 / 4.69; EPYC 9V45 4.76 / 3.73 / **3.50** / 3.64 / 3.71 / 3.50. Container warm v10 / F1 / F2: 2.012 / 1.785 / **1.685**; 1.590 / 1.418 / **1.343**; 1.327 / 1.131 / **1.069** | F2 kept (-3 to -6% CPU over F1 on all three). Larger shards and PLAIN: no consistent gain, defaults unchanged (2^16, dictionary output). Tagged v11 |
+| F1 | Fast path + direct product/campaign lookups (c8e8a63) vs v10, same job | CPU-s (native, 4 threads) v10 / fast / general-only: EPYC 9V74 5.71 / **4.76** / 5.55; EPYC 7763 6.72 / **5.69** / 6.56; EPYC 9V74 5.68 / **4.72** / 5.52 (-15 to -17%). Container warm 1.624 -> 1.413, 1.915 -> 1.701, 1.626 -> 1.413 (-11 to -13%); cold -2 to -10%. Max RSS 2050 -> 1678 MiB | Kept. The general-only run (`PIPELINE_FAST=0`) is faster than v10 everywhere, so the fallback costs nothing |
 
 ### What's next (ranked by the v9 breakdown)
 1. Events read+parse (~48% of warm wall): the partition scatter in `flush` (35% of that symbol is the two 32-byte record writes to 256 x 2 streams) -> software write-combining or fewer streams; the timestamp parser (~13% of the events callback); the tokenizer's per-field unquote (`emit`, ~27% of the tokenizer).

@@ -16,8 +16,13 @@
 //! 5. Per person partition: drop tombstoned events, sort, sessionize, credit
 //!    and assist, and aggregate.
 //! 6. Write Parquet.
+//!
+//! When the IDs are in the generator's format, `fast.rs` replaces steps 2-4
+//! for most persons and finishes them itself; the rest go through step 5.
 
 mod csv;
+mod direct;
+mod fast;
 mod key;
 mod links;
 mod out;
@@ -50,11 +55,23 @@ const LOOKBACK: i64 = 7 * DAY;
 /// Records are spread over this many hash partitions (a power of two).
 const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
-const CHUNK_BYTES: u64 = 2 << 20;
+/// Input chunk size; `PIPELINE_CHUNK_KB` overrides it for A/B runs.
+fn chunk_bytes() -> u64 {
+    static BYTES: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        std::env::var("PIPELINE_CHUNK_KB").ok().and_then(|v| v.parse::<u64>().ok()).filter(|&kb| kb >= 16).map_or(2 << 20, |kb| kb << 10)
+    })
+}
 
 #[inline(always)]
 fn partition(key: Key) -> usize {
-    (hash(key) >> (64 - PARTITION_BITS)) as usize
+    partition_of_hash(hash(key))
+}
+
+/// `partition(key)` given `hash(key)`.
+#[inline(always)]
+fn partition_of_hash(hashed: u64) -> usize {
+    (hashed >> (64 - PARTITION_BITS)) as usize
 }
 
 /// A surviving-so-far event in its person's partition.
@@ -112,12 +129,12 @@ type CampaignCounts = [u64; 4];
 
 struct Lookups {
     /// product_id -> category index
-    products: FastMap<Key, u16>,
+    products: direct::DirectIndex<u16>,
     /// Sorted category names, `unknown` included.
     categories: Vec<Vec<u8>>,
     unknown: u16,
     /// campaign_id -> campaign index
-    campaigns: FastMap<Key, u32>,
+    campaigns: direct::DirectIndex<u32>,
     campaign_names: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
 }
@@ -153,25 +170,41 @@ fn main() {
     let lookups = read_lookups(&data, &interner);
     log("lookups");
 
-    let names = links::build(&data, &interner, threads, CHUNK_BYTES);
+    let (names, linked) = links::build_linked(&data, &interner, threads, chunk_bytes());
     log("links");
-
-    let events = parse_events(&data, &interner, &names, &lookups, &window, threads);
-    log("events parsed");
-    let deletions = dedup_events(events.copies, threads);
-    log("events deduplicated");
-    let clicks = parse_clicks(&data, &interner, &names, &lookups, &window, threads);
-    log("clicks parsed");
-    drop(names);
-    let strings = interner.finish();
 
     // `PIPELINE_EARLY_WRITE=0` (A/B only): write everything at the end, no writeback hints.
     let early = std::env::var_os("PIPELINE_EARLY_WRITE").is_none_or(|v| v != "0");
     out::set_writeback(early);
     let user_dir = out::create_dirs(&output);
-    let results =
-        sessionize(events.people, deletions, clicks, &lookups, &window, &strings, threads, early.then_some(&*user_dir));
-    log("sessionized");
+    let early_dir = early.then_some(&*user_dir);
+
+    let (results, strings) = match fast::prepare(&data, &interner, &names, linked, &lookups, &window, threads, &log) {
+        Some(prepared) => {
+            let strings = interner.finish();
+            let (mut results, people, clicks) =
+                fast::finish(prepared, &names, &lookups, &window, &strings, threads, early_dir);
+            drop(names);
+            log("fast path sessionized");
+            let deletions = (0..PARTITIONS).map(|_| Mutex::new(Vec::new())).collect();
+            results.extend(sessionize(people, deletions, clicks, &lookups, &window, &strings, threads, early_dir));
+            log("sessionized");
+            (results, strings)
+        }
+        None => {
+            let events = parse_events(&data, &interner, &names, &lookups, &window, threads);
+            log("events parsed");
+            let deletions = dedup_events(events.copies, threads);
+            log("events deduplicated");
+            let clicks = parse_clicks(&data, &interner, &names, &lookups, &window, threads);
+            log("clicks parsed");
+            drop(names);
+            let strings = interner.finish();
+            let results = sessionize(events.people, deletions, clicks, &lookups, &window, &strings, threads, early_dir);
+            log("sessionized");
+            (results, strings)
+        }
+    };
 
     out::write_all(&output, results, &lookups, &window, &strings, threads);
     log("written");
@@ -242,7 +275,14 @@ fn read_lookups(data: &Path, interner: &Interner) -> Lookups {
             }
         }
     });
-    Lookups { products: products_map, categories, unknown, campaigns, campaign_names, channels }
+    Lookups {
+        products: direct::DirectIndex::from_map(b"p", products_map),
+        categories,
+        unknown,
+        campaigns: direct::DirectIndex::from_map(b"c_", campaigns),
+        campaign_names,
+        channels,
+    }
 }
 
 fn new_partitions<T>() -> Vec<Vec<T>> {
@@ -297,8 +337,9 @@ fn parse_events(
     window: &Window,
     threads: usize,
 ) -> ParsedEvents {
+    let skip: u8 = std::env::var("PIPELINE_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let files = Files::open_folder(&data.join("events"));
-    let chunks = files.chunks(CHUNK_BYTES);
+    let chunks = files.chunks(chunk_bytes());
     // Event lines average ~75 bytes; reserve for a little more rows than that,
     // so the partition buffers almost never grow (and copy).
     let capacity = partition_capacity(files.total_bytes() / 64, threads);
@@ -323,8 +364,16 @@ fn parse_events(
         copies: Vec<Vec<EventCopy>>,
         pending: Vec<Pending>,
         dates: ts::Parser,
+        /// Diagnostics only (`PIPELINE_SKIP`, wrong output): bit 0 skips the
+        /// dedup copies, bit 1 the person records, bit 2 the whole lookup and
+        /// scatter, bit 3 everything after tokenizing.
+        skip: u8,
     }
     fn flush(state: &mut State, names: &links::Names) {
+        if state.skip & 4 != 0 {
+            state.pending.clear();
+            return;
+        }
         for row in state.pending.iter_mut() {
             row.linked = names.may_be_linked(row.hashed);
             if row.linked {
@@ -332,12 +381,21 @@ fn parse_events(
             }
         }
         for row in &state.pending {
-            let person = if row.linked { names.resolve(row.user, row.hashed) } else { row.user };
-            let part = partition(person);
+            // An unlinked user is its own person: its hash is already known.
+            let (person, part) = if row.linked {
+                let person = names.resolve(row.user, row.hashed);
+                (person, partition(person))
+            } else {
+                (row.user, partition_of_hash(row.hashed))
+            };
             let buffer = &mut state.people[part];
             let location = location_of(part, state.thread, buffer.len());
-            buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
-            state.copies[partition(row.event_id)].push(EventCopy { event_id: row.event_id, ingest: row.ingest, location });
+            if state.skip & 2 == 0 {
+                buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
+            }
+            if state.skip & 1 == 0 {
+                state.copies[partition(row.event_id)].push(EventCopy { event_id: row.event_id, ingest: row.ingest, location });
+            }
         }
         state.pending.clear();
     }
@@ -350,11 +408,12 @@ fn parse_events(
             copies: sized_partitions(capacity),
             pending: Vec::with_capacity(BATCH),
             dates: ts::Parser::default(),
+            skip,
         },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
                 for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
-                    if event_id.is_empty() {
+                    if event_id.is_empty() || state.skip & 8 != 0 {
                         return;
                     }
                     let event_id = interner.key_in(bytes, event_id);
@@ -378,7 +437,7 @@ fn parse_events(
                         if purchase {
                             let Some(value) = ts::price(price_text) else { break 'validate };
                             price = value;
-                            category = lookups.products.get(&interner.key_in(bytes, product)).copied().unwrap_or(lookups.unknown);
+                            category = lookups.products.get(product, || interner.key_in(bytes, product)).unwrap_or(lookups.unknown);
                         }
                         if ingest.saturating_sub(ts) > LATE_LIMIT {
                             break 'validate;
@@ -403,7 +462,9 @@ fn parse_events(
                         return;
                     }
                     // Failed validation: only the dedup copy is kept.
-                    state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                    if state.skip & 1 == 0 {
+                        state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                    }
                 });
                 flush(state, names);
             });
@@ -484,7 +545,7 @@ fn parse_clicks(
     threads: usize,
 ) -> Partitioned<PersonClick> {
     let files = Files::open_folder(&data.join("clicks"));
-    let chunks = files.chunks(CHUNK_BYTES);
+    let chunks = files.chunks(chunk_bytes());
     // Click lines average ~45 bytes.
     let capacity = partition_capacity(files.total_bytes() / 38, threads);
     struct State {
@@ -501,10 +562,13 @@ fn parse_clicks(
             }
         }
         for &(mut click, hashed, linked) in &state.pending {
-            if linked {
+            let part = if linked {
                 click.person = names.resolve(click.person, hashed);
-            }
-            state.parts[partition(click.person)].push(click);
+                partition(click.person)
+            } else {
+                partition_of_hash(hashed)
+            };
+            state.parts[part].push(click);
         }
         state.pending.clear();
     }
@@ -526,7 +590,7 @@ fn parse_clicks(
                     if ts < window.click_start || ts >= window.end {
                         return;
                     }
-                    let Some(&campaign) = lookups.campaigns.get(&interner.key_in(bytes, campaign)) else { return };
+                    let Some(campaign) = lookups.campaigns.get(campaign, || interner.key_in(bytes, campaign)) else { return };
                     let user = interner.key_in(bytes, user);
                     let hashed = hash(user);
                     names.prefetch_filter(hashed);
@@ -551,6 +615,20 @@ pub struct ThreadResult {
     pub campaigns: Vec<CampaignCounts>,
     thread: usize,
     files: usize,
+    scratch: PersonScratch,
+}
+
+impl ThreadResult {
+    /// `thread` names its early files; `categories` sizes the scratch.
+    fn new(thread: usize, lookups: &Lookups, window: &Window) -> ThreadResult {
+        ThreadResult {
+            user_days: Vec::new(),
+            campaigns: vec![[0; 4]; (lookups.campaign_names.len() + 1) * window.days],
+            thread,
+            files: 0,
+            scratch: PersonScratch::new(lookups.categories.len()),
+        }
+    }
 }
 
 /// user_daily rows a sessionizing thread collects before it writes them out
@@ -577,18 +655,11 @@ fn sessionize(
     early_dir: Option<&Path>,
 ) -> Vec<ThreadResult> {
     let organic = lookups.campaign_names.len();
-    let days = window.days;
-    let categories = lookups.categories.len();
     let order = largest_first(&people);
     par::run(
         threads,
         PARTITIONS,
-        |thread| ThreadResult {
-            user_days: Vec::new(),
-            campaigns: vec![[0; 4]; (organic + 1) * days],
-            thread,
-            files: 0,
-        },
+        |thread| ThreadResult::new(thread, lookups, window),
         |result, item| {
             let index = order[item];
             let begin = Instant::now();
@@ -674,106 +745,21 @@ fn sessionize(
             }
             // SAFETY: as for the events, every slot in 0..sum was written once.
             unsafe { clicks.set_len(sum) };
-            drop(click_buffers);            // Sort each person's clicks by ts, then click_id byte-wise, and drop
-            // identical copies (Clicks 2), which are now neighbours.
+            drop(click_buffers);
             let mut click_ends: Vec<usize> = vec![0; persons.len()];
             for person in 0..persons.len() {
                 let (start, end) = (click_starts[person], click_starts[person + 1]);
-                let slice = &mut clicks[start..end];
-                slice.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| strings.cmp(a.click_id, b.click_id)));
-                let mut kept = 0;
-                for at in 0..slice.len() {
-                    if kept == 0 || slice[kept - 1].click_id != slice[at].click_id {
-                        slice[kept] = slice[at];
-                        kept += 1;
-                    }
-                }
-                click_ends[person] = start + kept;
+                click_ends[person] = start + sort_clicks(&mut clicks[start..end], strings);
             }
             timing::GROUP_CLICKS.add_since(begin);
             let begin = Instant::now();
             let loop_start = timing::ticks();
-            let mut attribution_ticks = 0u64;
-
-            let mut sessions: Vec<Session> = Vec::new();
-            let mut category_sums: Vec<u64> = vec![0; categories];
-            let mut touched: Vec<u16> = Vec::new();
-            let mut scratch = AttributionScratch::default();
-
+            let scratch = &mut result.scratch;
+            scratch.attribution_ticks = 0;
             for (index, &person) in persons.iter().enumerate() {
-                let (at, end) = (event_starts[index], event_starts[index + 1]);
+                let events = &events[event_starts[index]..event_starts[index + 1]];
                 let person_clicks = &clicks[click_starts[index]..click_ends[index]];
-                // Events 5-6: sessions by gaps over 30 minutes between distinct timestamps.
-                sessions.clear();
-                let mut previous = i64::MIN;
-                for event in &events[at..end] {
-                    if sessions.is_empty() || event.ts - previous > SESSION_GAP {
-                        sessions.push(Session {
-                            start: event.ts,
-                            day: (event.ts.div_euclid(DAY) - window.first_day) as usize,
-                            events: 0,
-                            revenue: 0,
-                            purchase: false,
-                        });
-                    }
-                    previous = event.ts;
-                    let session = sessions.last_mut().unwrap();
-                    session.events += 1;
-                    if event.flags & PURCHASE != 0 {
-                        session.revenue += event.price as u64;
-                        session.purchase = true;
-                    }
-                }
-
-                // user_daily: sessions are in start order, so days come in runs.
-                let mut session_at = 0;
-                let mut event_at = at;
-                while session_at < sessions.len() {
-                    let day = sessions[session_at].day;
-                    let mut row = UserDay {
-                        person,
-                        day: (window.first_day + day as i64) as i32,
-                        sessions: 0,
-                        events: 0,
-                        revenue: 0,
-                        top: NO_CATEGORY,
-                    };
-                    while session_at < sessions.len() && sessions[session_at].day == day {
-                        let session = &sessions[session_at];
-                        row.sessions += 1;
-                        row.events += session.events;
-                        row.revenue += session.revenue;
-                        if session.purchase {
-                            for event in &events[event_at..event_at + session.events as usize] {
-                                if event.flags & PURCHASE != 0 {
-                                    let category = event.category as usize;
-                                    if category_sums[category] == 0 {
-                                        touched.push(event.category);
-                                    }
-                                    category_sums[category] += event.price as u64;
-                                }
-                            }
-                        }
-                        event_at += session.events as usize;
-                        session_at += 1;
-                    }
-                    // Events 7 / top_category: highest sum, ties to the smallest name.
-                    let mut best: u64 = 0;
-                    for &category in &touched {
-                        let sum = category_sums[category as usize];
-                        if sum > best || (sum == best && category < row.top) {
-                            best = sum;
-                            row.top = category;
-                        }
-                        category_sums[category as usize] = 0;
-                    }
-                    touched.clear();
-                    result.user_days.push(row);
-                }
-
-                let attribution_start = timing::ticks();
-                attribute(&sessions, person_clicks, organic, days, &mut result.campaigns, &mut scratch);
-                attribution_ticks += timing::ticks().wrapping_sub(attribution_start);
+                finish_person(person, events, person_clicks, window, organic, scratch, &mut result.user_days, &mut result.campaigns);
             }
             // Split the measured span by the cycle-count share of attribution.
             let nanos = begin.elapsed().as_nanos() as u64;
@@ -781,24 +767,147 @@ fn sessionize(
             let attribution = if loop_ticks == 0 {
                 0
             } else {
-                (nanos as f64 * (attribution_ticks as f64 / loop_ticks as f64).min(1.0)) as u64
+                (nanos as f64 * (scratch.attribution_ticks as f64 / loop_ticks as f64).min(1.0)) as u64
             };
             timing::ATTRIBUTION.add_nanos(attribution);
             timing::SESSIONS.add_nanos(nanos - attribution);
-
-            // Write finished rows while sessionizing goes on, so the disk works
-            // in parallel: the container's exit waits for the output to be on
-            // disk (PROGRESS.md, H5b).
-            if let Some(dir) = early_dir {
-                if result.user_days.len() >= EARLY_FILE_ROWS {
-                    let name = format!("part-t{:02}-{:04}.parquet", result.thread, result.files);
-                    out::write_user_daily(&dir.join(name), &result.user_days, lookups, strings);
-                    result.files += 1;
-                    result.user_days.clear();
-                }
-            }
+            write_early(result, early_dir, lookups, strings);
         },
     )
+}
+
+/// Writes a thread's finished rows once there are enough of them, so the disk
+/// works while sessionizing goes on: the container's exit waits for the
+/// output to be on disk (PROGRESS.md, H5b).
+fn write_early(result: &mut ThreadResult, early_dir: Option<&Path>, lookups: &Lookups, strings: &Strings) {
+    if let Some(dir) = early_dir {
+        if result.user_days.len() >= EARLY_FILE_ROWS {
+            let name = format!("part-t{:02}-{:04}.parquet", result.thread, result.files);
+            out::write_user_daily(&dir.join(name), &result.user_days, lookups, strings);
+            result.files += 1;
+            result.user_days.clear();
+        }
+    }
+}
+
+/// Sorts one person's valid clicks by ts, then click_id byte-wise, and drops
+/// identical copies (Clicks 2), which are then neighbours. Returns how many
+/// are kept, at the front.
+#[inline]
+fn sort_clicks(clicks: &mut [PersonClick], strings: &Strings) -> usize {
+    clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| strings.cmp(a.click_id, b.click_id)));
+    let mut kept = 0;
+    for at in 0..clicks.len() {
+        if kept == 0 || clicks[kept - 1].click_id != clicks[at].click_id {
+            clicks[kept] = clicks[at];
+            kept += 1;
+        }
+    }
+    kept
+}
+
+/// Reused buffers for `finish_person`.
+struct PersonScratch {
+    sessions: Vec<Session>,
+    category_sums: Vec<u64>,
+    touched: Vec<u16>,
+    attribution: AttributionScratch,
+    /// rdtsc ticks spent in attribution (timing only).
+    attribution_ticks: u64,
+}
+
+impl PersonScratch {
+    fn new(categories: usize) -> PersonScratch {
+        PersonScratch {
+            sessions: Vec::new(),
+            category_sums: vec![0; categories],
+            touched: Vec::new(),
+            attribution: AttributionScratch::default(),
+            attribution_ticks: 0,
+        }
+    }
+}
+
+/// Events 5-7 and Clicks 4-7 for one person: `events` are their surviving
+/// events sorted by ts; `clicks` their valid clicks as `sort_clicks` leaves
+/// them. Appends the person's user_daily rows and adds to `campaigns`.
+#[inline]
+fn finish_person(
+    person: Key,
+    events: &[PersonEvent],
+    clicks: &[PersonClick],
+    window: &Window,
+    organic: usize,
+    scratch: &mut PersonScratch,
+    user_days: &mut Vec<UserDay>,
+    campaigns: &mut [CampaignCounts],
+) {
+    let PersonScratch { sessions, category_sums, touched, attribution, attribution_ticks } = scratch;
+    // Events 5-6: sessions by gaps over 30 minutes between distinct timestamps.
+    sessions.clear();
+    let mut previous = i64::MIN;
+    for event in events {
+        if sessions.is_empty() || event.ts - previous > SESSION_GAP {
+            sessions.push(Session {
+                start: event.ts,
+                day: (event.ts.div_euclid(DAY) - window.first_day) as usize,
+                events: 0,
+                revenue: 0,
+                purchase: false,
+            });
+        }
+        previous = event.ts;
+        let session = sessions.last_mut().unwrap();
+        session.events += 1;
+        if event.flags & PURCHASE != 0 {
+            session.revenue += event.price as u64;
+            session.purchase = true;
+        }
+    }
+
+    // user_daily: sessions are in start order, so days come in runs.
+    let mut session_at = 0;
+    let mut event_at = 0;
+    while session_at < sessions.len() {
+        let day = sessions[session_at].day;
+        let mut row =
+            UserDay { person, day: (window.first_day + day as i64) as i32, sessions: 0, events: 0, revenue: 0, top: NO_CATEGORY };
+        while session_at < sessions.len() && sessions[session_at].day == day {
+            let session = &sessions[session_at];
+            row.sessions += 1;
+            row.events += session.events;
+            row.revenue += session.revenue;
+            if session.purchase {
+                for event in &events[event_at..event_at + session.events as usize] {
+                    if event.flags & PURCHASE != 0 {
+                        let category = event.category as usize;
+                        if category_sums[category] == 0 {
+                            touched.push(event.category);
+                        }
+                        category_sums[category] += event.price as u64;
+                    }
+                }
+            }
+            event_at += session.events as usize;
+            session_at += 1;
+        }
+        // Events 7 / top_category: highest sum, ties to the smallest name.
+        let mut best: u64 = 0;
+        for &category in touched.iter() {
+            let sum = category_sums[category as usize];
+            if sum > best || (sum == best && category < row.top) {
+                best = sum;
+                row.top = category;
+            }
+            category_sums[category as usize] = 0;
+        }
+        touched.clear();
+        user_days.push(row);
+    }
+
+    let attribution_start = timing::ticks();
+    attribute(sessions, clicks, organic, window.days, campaigns, attribution);
+    *attribution_ticks += timing::ticks().wrapping_sub(attribution_start);
 }
 
 /// Turns counts into start offsets in place; returns the total.

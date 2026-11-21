@@ -380,7 +380,8 @@ mod tests {
                 }
                 2 => {
                     let zeros = "0".repeat((next() % 6) as usize);
-                    format!("{zeros}{}", next() % 10u64.pow((next() % 20) as u32 + 1)).into_bytes()
+                    // Up to 19 digits (10^19 still fits in a u64).
+                    format!("{zeros}{}", next() % 10u64.pow((next() % 19) as u32 + 1)).into_bytes()
                 }
                 _ => (0..next() % 30).map(|_| noise[(next() % noise.len() as u64) as usize]).collect(),
             };
