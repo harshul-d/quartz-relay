@@ -1,4 +1,4 @@
-READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: 5.4 s on a throttled, battery-powered laptop where v1 takes 15.6 s; about 2.4 s for the near-identical v6 on mains power)
+READY TO SUBMIT: v8 fa0d6d2de35482cee9c7ab7f9b56262d0153cbc4 (v7's code with neutral names; same 20M timing as v7)
 
 # Progress
 
