@@ -1,8 +1,8 @@
 # name  git-ref  [KEY=VALUE ...]  (extra container environment for flag-gated experiments;
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
-head          HEAD
-head-_exit    HEAD  PIPELINE_EXIT=_exit
-head-release  HEAD  PIPELINE_EXIT=release
-probe-0       HEAD  PIPELINE_PROBE_MB=0
-probe-2g      HEAD  PIPELINE_PROBE_MB=2048
+head             HEAD
+head-fsync       HEAD  PIPELINE_FSYNC=1
+probe-0          HEAD  PIPELINE_PROBE_MB=0
+probe-w93        HEAD  PIPELINE_PROBE_MB=0 PIPELINE_PROBE_WRITE_MB=93
+probe-w93-fsync  HEAD  PIPELINE_PROBE_MB=0 PIPELINE_PROBE_WRITE_MB=93 PIPELINE_FSYNC=1

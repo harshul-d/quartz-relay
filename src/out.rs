@@ -283,7 +283,19 @@ impl Writer {
         self.file.extend_from_slice(&meta.out);
         self.file.extend_from_slice(&(meta.out.len() as u32).to_le_bytes());
         self.file.extend_from_slice(b"PAR1");
-        std::fs::write(path, &self.file).unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+        write_file(path, &self.file);
+    }
+}
+
+/// Writes a whole output file. Experiment `PIPELINE_FSYNC=1`: also flush it
+/// to disk before returning.
+pub fn write_file(path: &Path, bytes: &[u8]) {
+    use std::io::Write;
+    let fail = |error: std::io::Error| -> ! { panic!("write {}: {error}", path.display()) };
+    let mut file = std::fs::File::create(path).unwrap_or_else(|e| fail(e));
+    file.write_all(bytes).unwrap_or_else(|e| fail(e));
+    if std::env::var_os("PIPELINE_FSYNC").is_some_and(|v| v == "1") {
+        file.sync_data().unwrap_or_else(|e| fail(e));
     }
 }
 

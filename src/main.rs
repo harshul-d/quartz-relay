@@ -140,6 +140,8 @@ fn main() {
     let begin = Instant::now();
     timing::epoch("main-start");
     let exit_mode = std::env::var("PIPELINE_EXIT").unwrap_or_default();
+    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
+    let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     if let Some(megabytes) = std::env::var("PIPELINE_PROBE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
         // Experiment probe: touch this much fresh memory, then exit without work.
         let mut block = vec![0u8; megabytes << 20];
@@ -149,12 +151,16 @@ fn main() {
         std::hint::black_box(&block);
         eprintln!("{:>8.3}s probe touched {megabytes} MB", begin.elapsed().as_secs_f64());
         std::mem::forget(block);
+        if let Some(written) = std::env::var("PIPELINE_PROBE_WRITE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+            // ... and write this much to an output file (fsynced if PIPELINE_FSYNC=1).
+            let bytes: Vec<u8> = (0..written << 20).map(|i| (i * 7 + i / 4093) as u8).collect();
+            out::write_file(&output.join("probe.bin"), &bytes);
+            eprintln!("{:>8.3}s probe wrote {written} MB", begin.elapsed().as_secs_f64());
+        }
         eprintln!("{:>8.3}s end of main", begin.elapsed().as_secs_f64());
         timing::epoch("main-end");
         return;
     }
-    let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
-    let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = std::env::var("NCPU")
         .ok()
         .and_then(|n| n.trim().parse::<usize>().ok())
