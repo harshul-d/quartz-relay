@@ -104,12 +104,12 @@ type CampaignCounts = [u64; 4];
 
 struct Lookups {
     /// product_id -> category index
-    products: FastMap<Vec<u8>, u16>,
+    products: FastMap<Key, u16>,
     /// Sorted category names, `unknown` included.
     categories: Vec<Vec<u8>>,
     unknown: u16,
     /// campaign_id -> campaign index
-    campaigns: FastMap<Vec<u8>, u32>,
+    campaigns: FastMap<Key, u32>,
     campaign_names: Vec<Vec<u8>>,
     channels: Vec<Vec<u8>>,
 }
@@ -135,8 +135,8 @@ fn main() {
     let log = |what: &str| eprintln!("{:>8.3}s {what}", begin.elapsed().as_secs_f64());
 
     let window = read_window(&data.join("manifest.json"));
-    let lookups = read_lookups(&data);
     let interner = Interner::default();
+    let lookups = read_lookups(&data, &interner);
     log("lookups");
 
     let names = links::build(&data, &interner, threads, CHUNK_BYTES);
@@ -178,7 +178,7 @@ fn read_window(path: &Path) -> Window {
     Window { start, end, click_start: start - LOOKBACK, first_day, days }
 }
 
-fn read_lookups(data: &Path) -> Lookups {
+fn read_lookups(data: &Path, interner: &Interner) -> Lookups {
     let mut product_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     for_each_line(&csv::read_data_lines(&data.join("products.csv")), |line| {
         if let Some([product, category]) = split::<2>(line) {
@@ -195,12 +195,12 @@ fn read_lookups(data: &Path) -> Lookups {
     let category_index: FastMap<Vec<u8>, u16> =
         categories.iter().enumerate().map(|(i, c)| (c.clone(), i as u16)).collect();
     let unknown = category_index[&b"unknown"[..]];
-    let mut products_map: FastMap<Vec<u8>, u16> = FastMap::default();
+    let mut products_map: FastMap<Key, u16> = FastMap::default();
     for (product, category) in product_rows {
-        products_map.insert(product, category_index[&category]); // a repeated ID keeps its last row
+        products_map.insert(interner.key(&product), category_index[&category]); // a repeated ID keeps its last row
     }
 
-    let mut campaigns: FastMap<Vec<u8>, u32> = FastMap::default();
+    let mut campaigns: FastMap<Key, u32> = FastMap::default();
     let mut campaign_names = Vec::new();
     let mut channels = Vec::new();
     for_each_line(&csv::read_data_lines(&data.join("campaigns.csv")), |line| {
@@ -208,10 +208,10 @@ fn read_lookups(data: &Path) -> Lookups {
             if campaign.is_empty() || channel.is_empty() {
                 return;
             }
-            match campaigns.get(campaign) {
+            match campaigns.get(&interner.key(campaign)) {
                 Some(&index) => channels[index as usize] = channel.to_vec(),
                 None => {
-                    campaigns.insert(campaign.to_vec(), campaign_names.len() as u32);
+                    campaigns.insert(interner.key(campaign), campaign_names.len() as u32);
                     campaign_names.push(campaign.to_vec());
                     channels.push(channel.to_vec());
                 }
@@ -294,7 +294,7 @@ fn parse_events(
                         if purchase {
                             let Some(value) = ts::price(price_text) else { break 'validate };
                             price = value;
-                            category = lookups.products.get(product).copied().unwrap_or(lookups.unknown);
+                            category = lookups.products.get(&interner.key(product)).copied().unwrap_or(lookups.unknown);
                         }
                         if ingest.saturating_sub(ts) > LATE_LIMIT {
                             break 'validate;
@@ -395,7 +395,7 @@ fn parse_clicks(
                 if ts < window.click_start || ts >= window.end {
                     return;
                 }
-                let Some(&campaign) = lookups.campaigns.get(campaign) else { return };
+                let Some(&campaign) = lookups.campaigns.get(&interner.key(campaign)) else { return };
                 let person = names.person(interner.key(user));
                 parts[partition(person)].push(PersonClick { person, click_id: interner.key(click_id), ts, campaign });
             })
