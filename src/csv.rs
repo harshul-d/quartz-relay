@@ -151,12 +151,175 @@ fn emit<const N: usize>(bytes: &[u8], spans: &[(usize, usize); N], quotes: u32, 
     each(&values);
 }
 
+/// Whether `for_each_record` splits line by line (default) or walks every
+/// separator of every block (`PIPELINE_SPLIT=blocks`, for A/B runs).
+fn split_lines() -> bool {
+    static LINES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *LINES.get_or_init(|| std::env::var("PIPELINE_SPLIT").map_or(true, |v| v != "blocks"))
+}
+
 /// Calls `each` with the `N` unquoted values of every well-formed line of
 /// `bytes` (a run of whole lines; the last may lack its `\n`). Malformed and
-/// empty lines are skipped. Same result as `for_each_line` + `split::<N>`,
-/// from one SIMD pass that marks separators and quotes per 64-byte block.
+/// empty lines are skipped. Same result as `for_each_line` + `split::<N>`.
 #[inline(always)]
-pub fn for_each_record<const N: usize>(bytes: &[u8], mut each: impl FnMut(&[&[u8]; N])) {
+pub fn for_each_record<const N: usize>(bytes: &[u8], each: impl FnMut(&[&[u8]; N])) {
+    if split_lines() { for_each_record_lines(bytes, each) } else { for_each_record_blocks(bytes, each) }
+}
+
+/// Hands a line's fields to `each`: directly when the line has no quote,
+/// else through `emit`, which unwraps quoted fields and checks the count.
+#[inline(always)]
+fn finish<const N: usize>(bytes: &[u8], spans: &[(usize, usize); N], quotes: u32, each: &mut impl FnMut(&[&[u8]; N])) {
+    if quotes != 0 {
+        return emit(bytes, spans, quotes, each);
+    }
+    let values = spans.map(|(start, end)| {
+        debug_assert!(start <= end && end <= bytes.len());
+        // SAFETY: every caller builds ordered spans inside `bytes`.
+        unsafe { bytes.get_unchecked(start..end) }
+    });
+    each(&values);
+}
+
+/// A bit mask over a line window (`u64`: 64 bytes, `u128`: 128 bytes).
+trait Bits: Copy {
+    fn ones(self) -> u32;
+    fn lowest(self) -> usize;
+    fn rest(self) -> Self;
+}
+
+macro_rules! bits {
+    ($($t:ty),*) => {$(
+        impl Bits for $t {
+            #[inline(always)]
+            fn ones(self) -> u32 { self.count_ones() }
+            #[inline(always)]
+            fn lowest(self) -> usize { self.trailing_zeros() as usize }
+            #[inline(always)]
+            fn rest(self) -> Self { self & self.wrapping_sub(1) }
+        }
+    )*};
+}
+bits!(u64, u128);
+
+/// Cuts the line `bytes[start..end]` at its commas: `comma` and `quote` mark
+/// bytes of this line only (bit i = byte start + i, all below end - start).
+#[inline(always)]
+fn cut<const N: usize, B: Bits>(bytes: &[u8], start: usize, end: usize, mut comma: B, quote: B, each: &mut impl FnMut(&[&[u8]; N])) {
+    if comma.ones() as usize != N - 1 {
+        return;
+    }
+    let mut spans = [(0usize, 0usize); N];
+    let mut from = start;
+    for span in spans[..N - 1].iter_mut() {
+        let at = start + comma.lowest();
+        debug_assert!(from <= at && at < end);
+        *span = (from, at);
+        from = at + 1;
+        comma = comma.rest();
+    }
+    debug_assert!(from <= end && end <= bytes.len());
+    spans[N - 1] = (from, end);
+    finish(bytes, &spans, quote.ones(), each);
+}
+
+/// `cut` for a line too long for a 128-byte window, with `memchr`.
+#[cold]
+#[inline(never)]
+fn cut_long<const N: usize>(bytes: &[u8], start: usize, end: usize, each: &mut impl FnMut(&[&[u8]; N])) {
+    let line = &bytes[start..end];
+    let mut spans = [(0usize, 0usize); N];
+    let mut count = 0;
+    let mut from = start;
+    for comma in memchr_iter(b',', line) {
+        if count + 1 >= N {
+            return;
+        }
+        spans[count] = (from, start + comma);
+        count += 1;
+        from = start + comma + 1;
+    }
+    if count != N - 1 {
+        return;
+    }
+    spans[N - 1] = (from, end);
+    finish(bytes, &spans, memchr_iter(b'"', line).count() as u32, each);
+}
+
+/// `masks` of the 64 bytes at `at`; past the end of `bytes` the window is
+/// zero padding, which has no bits.
+#[inline(always)]
+fn window(bytes: &[u8], at: usize) -> (u64, u64, u64) {
+    match bytes.get(at..at + 64) {
+        Some(block) => masks(block.try_into().unwrap()),
+        None => tail_window(&bytes[at..]),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn tail_window(rest: &[u8]) -> (u64, u64, u64) {
+    let mut padded = [0u8; 64];
+    padded[..rest.len()].copy_from_slice(rest);
+    masks(&padded)
+}
+
+/// `for_each_record` that splits each line in one step: the masks of a 64-
+/// (or 128-) byte window from the line start give its end (first newline),
+/// its commas (exactly N - 1 before the end, else malformed) and whether it
+/// has quotes at all (only then are fields unwrapped). Longer lines take a
+/// `memchr` path.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+pub fn for_each_record_lines<const N: usize>(bytes: &[u8], mut each: impl FnMut(&[&[u8]; N])) {
+    let length = bytes.len();
+    let mut start = 0;
+    while start < length {
+        let (comma, newline, quote) = window(bytes, start);
+        if newline != 0 {
+            let inside = !newline & newline.wrapping_sub(1);
+            let end = start + newline.trailing_zeros() as usize;
+            cut(bytes, start, end, comma & inside, quote & inside, &mut each);
+            start = end + 1;
+            continue;
+        }
+        if start + 64 >= length {
+            // The last line, without `\n`; the window has no bits past it.
+            cut(bytes, start, length, comma, quote, &mut each);
+            return;
+        }
+        let (comma_high, newline_high, quote_high) = window(bytes, start + 64);
+        let comma = comma as u128 | (comma_high as u128) << 64;
+        let quote = quote as u128 | (quote_high as u128) << 64;
+        if newline_high != 0 {
+            let newline = (newline_high as u128) << 64;
+            let inside = !newline & newline.wrapping_sub(1);
+            let end = start + newline.trailing_zeros() as usize;
+            cut(bytes, start, end, comma & inside, quote & inside, &mut each);
+            start = end + 1;
+            continue;
+        }
+        if start + 128 >= length {
+            cut(bytes, start, length, comma, quote, &mut each);
+            return;
+        }
+        let end = memchr(b'\n', &bytes[start + 128..]).map_or(length, |at| start + 128 + at);
+        cut_long(bytes, start, end, &mut each);
+        start = end + 1;
+    }
+}
+
+/// Without AVX2 the line splitter is no faster: walk the blocks.
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+#[inline(always)]
+pub fn for_each_record_lines<const N: usize>(bytes: &[u8], each: impl FnMut(&[&[u8]; N])) {
+    for_each_record_blocks(bytes, each)
+}
+
+/// `for_each_record` from one SIMD pass that walks every separator of every
+/// 64-byte block, branching on newline per separator.
+#[inline(always)]
+pub fn for_each_record_blocks<const N: usize>(bytes: &[u8], mut each: impl FnMut(&[&[u8]; N])) {
     let length = bytes.len();
     let mut spans = [(0usize, 0usize); N];
     let mut count = 0usize; // fields ended so far in this line
@@ -558,7 +721,183 @@ mod tests {
     fn fast<const N: usize>(bytes: &[u8]) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
         for_each_record::<N>(bytes, |fields| out.push(fields.iter().map(|f| f.to_vec()).collect()));
+        let mut blocks: Vec<Vec<Vec<u8>>> = Vec::new();
+        for_each_record_blocks::<N>(bytes, |fields| blocks.push(fields.iter().map(|f| f.to_vec()).collect()));
+        assert_eq!(out, blocks);
         out
+    }
+
+    /// Every record as (offset in `bytes`, value) per field.
+    type Records = Vec<Vec<(usize, Vec<u8>)>>;
+
+    fn records<const N: usize>(bytes: &[u8], lines: bool) -> Records {
+        let mut out = Vec::new();
+        let base = bytes.as_ptr() as usize;
+        let mut push = |fields: &[&[u8]; N]| out.push(fields.iter().map(|f| (f.as_ptr() as usize - base, f.to_vec())).collect());
+        if lines { for_each_record_lines::<N>(bytes, &mut push) } else { for_each_record_blocks::<N>(bytes, &mut push) }
+        out
+    }
+
+    fn same<const N: usize>(bytes: &[u8], what: &str) -> usize {
+        let lines = records::<N>(bytes, true);
+        let blocks = records::<N>(bytes, false);
+        if lines != blocks {
+            panic!("{what}, N = {N}: {:?}\nlines  {lines:?}\nblocks {blocks:?}", String::from_utf8_lossy(bytes));
+        }
+        lines.len()
+    }
+
+    struct Random(u64);
+
+    impl Random {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// A dirty line of about `length` bytes with `fields` fields (before its own dirt).
+    fn dirty_line(random: &mut Random, fields: usize, length: usize, out: &mut Vec<u8>) {
+        let alphabet = b"abcxyz0189 ,\"\r\n";
+        let width = length / fields.max(1);
+        for field in 0..fields {
+            if field > 0 {
+                out.push(b',');
+            }
+            let quoted = random.below(3) == 0;
+            if quoted {
+                out.push(b'"');
+            }
+            for _ in 0..random.below(2 * width + 1) {
+                // Mostly clean bytes; separators and quotes now and then.
+                let byte = if random.below(40) == 0 { alphabet[10 + random.below(5)] } else { alphabet[random.below(10)] };
+                out.push(byte);
+            }
+            if quoted {
+                out.push(b'"');
+            }
+        }
+    }
+
+    /// The line splitter agrees with the block walker, slices included, on
+    /// lines of 0..300 bytes (64- and 128-byte windows, the long path, the
+    /// padded tail), with and without a final `\n`, at lengths near multiples of 64.
+    #[test]
+    fn lines_match_blocks() {
+        let mut random = Random(0x9E37_79B9_7F4A_7C15);
+        let (mut inputs, mut found) = (0usize, 0usize);
+        for round in 0..30_000 {
+            let n = [2, 4, 7][round % 3];
+            let mut bytes = Vec::new();
+            for _ in 0..random.below(8) {
+                let fields = if random.below(4) == 0 { random.below(n + 3) } else { n };
+                let length = random.below(300);
+                dirty_line(&mut random, fields, length, &mut bytes);
+                bytes.push(b'\n');
+            }
+            let mut variants = vec![bytes.clone()];
+            if bytes.last() == Some(&b'\n') {
+                variants.push(bytes[..bytes.len() - 1].to_vec());
+            }
+            // Cut within 2 bytes of two multiples of 64 the input reaches.
+            for _ in 0..2 {
+                let multiple = 64 * (1 + random.below(bytes.len() / 64 + 1));
+                for cut in multiple - 2..=(multiple + 2).min(bytes.len()) {
+                    variants.push(bytes[..cut].to_vec());
+                }
+            }
+            for variant in &variants {
+                let what = format!("round {round}");
+                found += same::<2>(variant, &what) + same::<4>(variant, &what) + same::<7>(variant, &what);
+                inputs += 1;
+            }
+        }
+        // Raw random bytes from the dialect's alphabet.
+        let alphabet = b"ab,,\"\"\n\n\r x";
+        for round in 0..20_000 {
+            let bytes: Vec<u8> = (0..random.below(400)).map(|_| alphabet[random.below(alphabet.len())]).collect();
+            let what = format!("raw round {round}");
+            found += same::<2>(&bytes, &what) + same::<4>(&bytes, &what) + same::<7>(&bytes, &what);
+            inputs += 1;
+        }
+        println!("{inputs} inputs, {found} records");
+        assert!(found > 100_000);
+    }
+
+    /// Realistic rows (events: 7 fields, clicks: 4, links: 2) with 20% of
+    /// fields quoted and a little dirt, in chunks of 1000 lines.
+    #[test]
+    fn lines_match_blocks_realistic() {
+        let mut random = Random(0x2545_F491_4F6C_DD1D);
+        let types = [&b"view"[..], b"add_to_cart", b"purchase", b"remove_from_cart"];
+        let mut total = 0usize;
+        for chunk in 0..300 {
+            let n = [7, 7, 4, 2][chunk % 4];
+            let mut bytes = Vec::new();
+            let mut lines = 0;
+            for _ in 0..1000 {
+                let mut fields: Vec<Vec<u8>> = match n {
+                    7 => vec![
+                        format!("e{}", random.next() % 100_000_000).into_bytes(),
+                        format!("u{}", random.next() % 1_000_000).into_bytes(),
+                        format!("2024-03-{:02}T{:02}:{:02}:{:02}Z", 1 + random.below(28), random.below(24), random.below(60), random.below(60)).into_bytes(),
+                        format!("2024-03-{:02} {:02}:{:02}:{:02}.{:03}", 1 + random.below(28), random.below(24), random.below(60), random.below(60), random.below(1000)).into_bytes(),
+                        types[random.below(types.len())].to_vec(),
+                        if random.below(10) == 0 { Vec::new() } else { format!("p{}", random.next() % 50_000).into_bytes() },
+                        format!("{}.{:02}", random.below(500), random.below(100)).into_bytes(),
+                    ],
+                    4 => vec![
+                        format!("c{}", random.next() % 100_000_000).into_bytes(),
+                        format!("u{}", random.next() % 1_000_000).into_bytes(),
+                        format!("camp_{}", random.below(500)).into_bytes(),
+                        format!("2024-03-{:02}T{:02}:{:02}:{:02}Z", 1 + random.below(28), random.below(24), random.below(60), random.below(60)).into_bytes(),
+                    ],
+                    _ => vec![format!("u{}", random.next() % 1_000_000).into_bytes(), format!("x{}", random.next() % 1_000_000).into_bytes()],
+                };
+                match random.below(100) {
+                    0 => fields[random.below(n)].push(b'"'),
+                    1 => fields[random.below(n)].push(b','),
+                    2 => fields[n - 1].push(b'\r'),
+                    3 => fields[random.below(n)].insert(0, b' '),
+                    _ => {}
+                }
+                for (k, field) in fields.iter().enumerate() {
+                    if k > 0 {
+                        bytes.push(b',');
+                    }
+                    let quoted = random.below(5) == 0;
+                    if quoted {
+                        bytes.push(b'"');
+                    }
+                    bytes.extend_from_slice(field);
+                    if quoted {
+                        bytes.push(b'"');
+                    }
+                }
+                bytes.push(b'\n');
+                lines += 1;
+                if random.below(200) == 0 {
+                    bytes.push(b'\n');
+                }
+            }
+            if chunk % 2 == 1 {
+                bytes.pop();
+            }
+            let what = format!("chunk {chunk}");
+            let found = match n {
+                7 => same::<7>(&bytes, &what),
+                4 => same::<4>(&bytes, &what),
+                _ => same::<2>(&bytes, &what),
+            };
+            assert!(found > lines * 9 / 10, "{found} of {lines}");
+            total += lines;
+        }
+        println!("{total} realistic lines");
     }
 
     /// The SIMD tokenizer agrees with the plain one on random dirty input.

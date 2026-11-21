@@ -3,3 +3,4 @@ data/
 out/
 dev/
 __pycache__/
+.claude/
