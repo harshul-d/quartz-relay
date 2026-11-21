@@ -122,6 +122,9 @@ def parse_stderr(text):
         m = re.match(r"^cpu (\S+) ([0-9.]+)$", line)
         if m:
             counters[m.group(1)] = float(m.group(2))
+        m = re.match(r"^epoch (\S+) ([0-9]+)$", line)
+        if m:
+            phases["epoch " + m.group(1)] = int(m.group(2))
     return phases, counters
 
 
@@ -132,8 +135,12 @@ def phase_durations(phases, wall):
         if name in phases:
             out[PHASE_LABELS[name]] = phases[name] - previous
             previous = phases[name]
-    if phases:
+    if "end of main" in phases or "written" in phases:
         out["outside main (start, exit, container)"] = wall - previous
+    e = {k[6:]: v for k, v in phases.items() if k.startswith("epoch ")}
+    if all(k in e for k in ("run-start", "main-start", "main-end", "run-end")):
+        out["start: run start -> main"] = (e["main-start"] - e["run-start"]) / 1e9
+        out["exit: end of main -> run end"] = (e["run-end"] - e["main-end"]) / 1e9
     return out
 
 
@@ -195,9 +202,11 @@ def timed_container(v, data, work, cpus, mem, entry=None, keep=None):
         d.mkdir()
         d.chmod(0o777)
     args = docker_args(v.image, data, out, scratch, cpus, mem, v.env, entry)
+    start_ns = time.time_ns()
     begin = time.perf_counter()
     p = subprocess.run(args, capture_output=True, text=True)
     wall = time.perf_counter() - begin
+    p.stderr += f"\nepoch run-start {start_ns}\nepoch run-end {time.time_ns()}\n"
     if p.returncode != 0:
         raise SystemExit(f"{v.name}: exit {p.returncode}\n{p.stderr[-3000:]}")
     if keep is not None and not keep.exists():
@@ -225,9 +234,11 @@ def timed_native(v, data, work, cpus):
     for item in v.env:
         key, _, value = item.partition("=")
         env[key] = value
+    start_ns = time.time_ns()
     begin = time.perf_counter()
     p = subprocess.run(["/usr/bin/time", "-v", str(v.binary)], capture_output=True, text=True, env=env)
     wall = time.perf_counter() - begin
+    p.stderr += f"\nepoch run-start {start_ns}\nepoch run-end {time.time_ns()}\n"
     if p.returncode != 0:
         raise SystemExit(f"{v.name} native: exit {p.returncode}\n{p.stderr[-3000:]}")
     stats = {}

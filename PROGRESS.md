@@ -25,6 +25,31 @@ Starting point: v8 scored 1.39 s on the scorer's hidden 20M practice data (leade
 - `ci/bench.py`: builds one image per line of `ci/variants.txt` (`name git-ref [ENV=VALUE ...]`, extra env for flag-gated experiments), one untimed warm-up run each, then 5 repetitions; in each repetition every variant (rotated order) runs cold (sync + drop_caches) and warm with the flags of `scripts/docker_run.sh` (`--cpus` = runner CPUs), then `/bin/true` in the same image cold and warm (container overhead), then natively under `/usr/bin/time -v`; plus a raw `cat` read floor. Wall = docker run start to exit. Reports median (min-max), per-phase medians from the binary's stderr, and checks each variant's 20M output against the first variant.
 - Phase log (always on, cost: one clock read per 2 MB chunk and per partition, an rdtsc pair per person): cumulative wall marks `lookups`, `links`, `events parsed`, `events deduplicated`, `clicks parsed`, `sessionized`, `written`, `end of main`, plus `cpu NAME SECONDS` counters summed over threads: `read` (positional reads), `group-events`, `group-clicks`, `sessions`, `attribution`. Time outside main (process start, exit/teardown, container) = wall - `end of main`.
 
+### Baseline breakdown of v8 (Actions; runner hardware changes between runs, so only same-job numbers compare)
+Run 464472a (AMD EPYC 7763, 4 vCPU = 2 cores x 2 threads, THP `madvise`), 20M seed 101 (1.89 GB), container, medians of 5:
+
+| Phase | warm s | cold s |
+| --- | --- | --- |
+| lookups | 0.012 | 0.013 |
+| ID linking | 0.112 | 0.110 |
+| events read+parse | 1.084 | 3.850 |
+| dedup | 0.074 | 0.076 |
+| clicks read+parse | 0.189 | 0.522 |
+| sessionize (group events 0.73 cpu-s, group clicks 0.31, sessions 0.17, attribution 0.46) | 0.419 | 0.417 |
+| output writing | 0.043 | 0.041 |
+| outside main (container start/stop, process start/exit) | 0.199 | 0.404 |
+| **total wall** | **2.129** | **5.436** |
+
+Same data: `docker run ... /bin/true` 0.166 s warm, 0.380 cold; natively the time outside main is 0.016-0.036 s; `cat` of all input 4.46 s cold (424 MB/s, no faster with 16 readers), 0.046 s warm. Native `/usr/bin/time -v`: max RSS 2.05 GB, 2,300 minor faults, user 6.9 s, system 0.5 s. First run (3e69c52, Intel Xeon 6975P, THP `always`): v8 1.72 s warm, 3.98 s cold.
+
+### Hypotheses tested
+| # | Hypothesis | Result | Decision |
+| --- | --- | --- | --- |
+| H1 | A shared floor outside parsing (reads, faults, start/exit, output) | Warm: outside-main 0.2 s of 2.1 s, of which 0.17 s is Docker itself (`/bin/true`); output 0.04 s. Cold: total = I/O floor + ~0.5 s. Parsing (events 51%, sessionize 20%) dominates warm. | Partly rejected: the floor exists only for cold reads. Since a 0.30 s leader cannot read 1.9 GB cold, the scorer is most likely warm; compute is the target. |
+| H2 | Page faults from fresh memory | 2,300 minor faults for 2 GB RSS (mimalloc's large aligned segments get THP even under `madvise`); THP `madvise` vs `always`, `MIMALLOC_ALLOW_LARGE_OS_PAGES=1`: all within noise | Rejected |
+| H3 | Process teardown/start | 0.02-0.04 s natively | Rejected (nothing to win) |
+| H4 | Cold reads: `POSIX_FADV_WILLNEED` on every input file from a background thread at start | cold 5.17 s (5.14-5.19) vs 5.44 (5.41-5.51); warm 2.10 vs 2.13 (noise) | Kept, default on (`PIPELINE_WILLNEED=0` disables) |
+
 ## Public clean-up (v8)
 - The public repo will be named quartz-relay. Every tracked file name and content was cleared of the event, sponsor and track names listed in the clean-up request (checked case-insensitively, allowing spaces, hyphens and underscores between word parts, with `git grep -iE` over all tracked files: no hits). They are deliberately not spelled out here.
 - Neutral names: package and binary `pipeline`, Docker image tag `pipeline:latest` (README, `scripts/docker_run.sh`), title "Click-stream sessionization pipeline". The Parquet writer's `created_by` metadata string is now `pipeline` (file metadata only; table contents are unchanged).

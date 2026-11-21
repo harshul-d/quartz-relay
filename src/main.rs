@@ -136,6 +136,7 @@ fn main() {
     // SAFETY: plain FFI call with valid arguments, before any threads start.
     unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
     let begin = Instant::now();
+    timing::epoch("main-start");
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = std::env::var("NCPU")
@@ -173,6 +174,7 @@ fn main() {
     eprintln!("threads {threads}");
     drop((lookups, strings));
     log("end of main");
+    timing::epoch("main-end");
 }
 
 /// manifest.json: `{"window_start": "...", "window_end": "..."}`.

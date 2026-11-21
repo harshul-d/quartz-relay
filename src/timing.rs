@@ -51,6 +51,13 @@ pub fn ticks() -> u64 {
     0
 }
 
+/// Prints `epoch NAME NANOS` (wall clock since 1970) on stderr, so a harness
+/// can split the time outside main into start-up and exit.
+pub fn epoch(name: &str) {
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    eprintln!("epoch {name} {nanos}");
+}
+
 /// Prints every counter as `cpu NAME SECONDS` on stderr.
 pub fn report() {
     for counter in [&READ, &GROUP_EVENTS, &GROUP_CLICKS, &SESSIONS, &ATTRIBUTION] {
