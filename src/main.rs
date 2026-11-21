@@ -170,7 +170,7 @@ fn main() {
     let lookups = read_lookups(&data, &interner);
     log("lookups");
 
-    let (names, linked) = links::build_linked(&data, &interner, threads, chunk_bytes());
+    let linked = links::build_linked(&data, &interner, threads, chunk_bytes());
     log("links");
 
     // `PIPELINE_EARLY_WRITE=0` (A/B only): write everything at the end, no writeback hints.
@@ -180,8 +180,7 @@ fn main() {
     let early_dir = early.then_some(&*user_dir);
 
     let (results, strings) = match fast::prepare(&data, &interner, linked, &lookups, &window, threads, &log) {
-        Some(prepared) => {
-            drop(names);
+        Ok(prepared) => {
             let mut strings = interner.finish();
             strings.set_resolver(prepared.resolver());
             let (mut results, people, clicks) = fast::finish(prepared, &lookups, &window, &strings, threads, early_dir);
@@ -191,7 +190,9 @@ fn main() {
             log("sessionized");
             (results, strings)
         }
-        None => {
+        Err(linked) => {
+            let names = linked.names(threads);
+            drop(linked);
             let events = parse_events(&data, &interner, &names, &lookups, &window, threads);
             log("events parsed");
             let deletions = dedup_events(events.copies, threads);

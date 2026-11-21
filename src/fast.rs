@@ -533,9 +533,9 @@ fn transpose_shards<T>(states: Vec<Vec<Vec<T>>>, shards: usize) -> Vec<Mutex<Vec
     by_shard.into_iter().map(Mutex::new).collect()
 }
 
-fn off(reason: &str) -> Option<Prepared> {
+fn off(reason: &str, linked: Linked) -> Result<Prepared, Linked> {
     eprintln!("fast-path off: {reason}");
-    None
+    Err(linked)
 }
 
 // ---------------------------------------------------------------- stage 1
@@ -550,25 +550,25 @@ pub fn prepare(
     window: &Window,
     threads: usize,
     log: &dyn Fn(&str),
-) -> Option<Prepared> {
+) -> Result<Prepared, Linked> {
     if std::env::var_os("PIPELINE_FAST").is_some_and(|v| v == "0") {
-        return off("disabled");
+        return off("disabled", linked);
     }
     if threads > MOST_THREADS {
-        return off("too many threads");
+        return off("too many threads", linked);
     }
     if window.end <= window.start || window.end - window.start >= NO_TS as i64 {
-        return off("window does not fit 32-bit offsets");
+        return off("window does not fit 32-bit offsets", linked);
     }
     if lookups.categories.len() > 255 {
-        return off("too many categories");
+        return off("too many categories", linked);
     }
     let files = Files::open_folder(&data.join("events"));
     let chunks = files.chunks(chunk_bytes());
     let begin = Instant::now();
     let keys = match recover_keys(&files, &chunks, &linked) {
         Ok(keys) => keys,
-        Err(reason) => return off(&reason),
+        Err(reason) => return off(&reason, linked),
     };
     eprintln!("fast-path keys user=0x{:x} event=0x{:x}", keys.user, keys.event);
     eprintln!(
@@ -595,10 +595,9 @@ pub fn prepare(
         (classify.join().unwrap(), parsed)
     });
     let (persons_of, states) = classified;
-    let linked_keys = std::sync::Arc::new(linked.keys);
     let shards = ((keys.events >> shard_bits) + 1) as usize;
     if let Some(reason) = states.iter().find_map(|state| state.abort) {
-        return off(reason);
+        return off(reason, linked);
     }
     let mut stats = Stats {
         rows: states.iter().map(|s| s.rows).sum(),
@@ -785,7 +784,8 @@ pub fn prepare(
     stats.clicks_general = general.iter().flatten().map(Vec::len).sum();
     log("clicks parsed");
 
-    Some(Prepared {
+    let linked_keys = std::sync::Arc::new(linked.keys);
+    Ok(Prepared {
         keys,
         survivors,
         odd,
