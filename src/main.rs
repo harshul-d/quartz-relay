@@ -35,8 +35,6 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 unsafe extern "C" {
     /// From the statically linked mimalloc (mimalloc.h).
     fn mi_option_set(option: i32, value: std::ffi::c_long);
-    fn mi_collect(force: bool);
-    fn _exit(code: i32) -> !;
 }
 /// `mi_option_purge_delay` in mimalloc 2.x's `mi_option_e`.
 const MI_OPTION_PURGE_DELAY: i32 = 15;
@@ -139,41 +137,8 @@ fn main() {
     unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
     let begin = Instant::now();
     timing::epoch("main-start");
-    let exit_mode = std::env::var("PIPELINE_EXIT").unwrap_or_default();
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
-    if let Some(megabytes) = std::env::var("PIPELINE_PROBE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
-        // Experiment probe: touch this much fresh memory, then exit without work.
-        let mut block = vec![0u8; megabytes << 20];
-        for page in block.chunks_mut(4096) {
-            page[0] = 1;
-        }
-        std::hint::black_box(&block);
-        eprintln!("{:>8.3}s probe touched {megabytes} MB", begin.elapsed().as_secs_f64());
-        std::mem::forget(block);
-        if std::env::var_os("PIPELINE_PROBE_READ").is_some_and(|v| v == "1") {
-            // ... and read every input file the way the pipeline does.
-            let mut bytes = 0u64;
-            for table in ["links", "events", "clicks"] {
-                let files = csv::Files::open_folder(&data.join(table));
-                let chunks = files.chunks(CHUNK_BYTES);
-                let sums = par::run(4, chunks.len(), |_| 0u64, |sum, index| {
-                    *sum += files.with_chunk(&chunks[index], |b| b.len() as u64);
-                });
-                bytes += sums.iter().sum::<u64>();
-            }
-            eprintln!("{:>8.3}s probe read {bytes} bytes", begin.elapsed().as_secs_f64());
-        }
-        if let Some(written) = std::env::var("PIPELINE_PROBE_WRITE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
-            // ... and write this much to an output file (fsynced if PIPELINE_FSYNC=1).
-            let bytes: Vec<u8> = (0..written << 20).map(|i| (i * 7 + i / 4093) as u8).collect();
-            out::write_file(&output.join("probe.bin"), &bytes);
-            eprintln!("{:>8.3}s probe wrote {written} MB", begin.elapsed().as_secs_f64());
-        }
-        eprintln!("{:>8.3}s end of main", begin.elapsed().as_secs_f64());
-        timing::epoch("main-end");
-        return;
-    }
     let threads = std::env::var("NCPU")
         .ok()
         .and_then(|n| n.trim().parse::<usize>().ok())
@@ -208,22 +173,8 @@ fn main() {
     timing::report();
     eprintln!("threads {threads}");
     drop((lookups, strings));
-    if exit_mode == "release" {
-        // Experiment: hand all free memory back to the OS before exiting.
-        // SAFETY: plain FFI calls with valid arguments.
-        unsafe {
-            mi_option_set(MI_OPTION_PURGE_DELAY, 0);
-            mi_collect(true);
-        }
-        log("memory released");
-    }
     log("end of main");
     timing::epoch("main-end");
-    if exit_mode == "_exit" {
-        // Experiment: skip atexit handlers (mimalloc's exit-time collect).
-        // SAFETY: every output file is closed and stderr is unbuffered.
-        unsafe { _exit(0) };
-    }
 }
 
 /// manifest.json: `{"window_start": "...", "window_end": "..."}`.

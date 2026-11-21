@@ -478,9 +478,10 @@ impl Writer {
     }
 }
 
-/// Writes a whole output file. Experiment `PIPELINE_FSYNC=1`: also flush it
-/// to disk before returning.
-pub fn write_file(path: &Path, bytes: &[u8]) {
+/// Writes a whole output file. `PIPELINE_FSYNC=1` (diagnostics) also flushes
+/// it to disk before returning, which moves the flush the container's exit
+/// otherwise waits for into the phase log.
+fn write_file(path: &Path, bytes: &[u8]) {
     use std::io::Write;
     let fail = |error: std::io::Error| -> ! { panic!("write {}: {error}", path.display()) };
     let mut file = std::fs::File::create(path).unwrap_or_else(|e| fail(e));
