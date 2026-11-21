@@ -802,7 +802,12 @@ fn write_early(result: &mut ThreadResult, early_dir: Option<&Path>, lookups: &Lo
 /// are kept, at the front.
 #[inline]
 fn sort_clicks(clicks: &mut [PersonClick], strings: &Strings) -> usize {
-    clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| strings.cmp(a.click_id, b.click_id)));
+    if clicks.iter().any(|c| key::is_long(c.click_id)) {
+        clicks.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| strings.cmp(a.click_id, b.click_id)));
+    } else {
+        // Packed keys already order as their bytes do.
+        clicks.sort_unstable_by_key(|c| (c.ts, c.click_id));
+    }
     let mut kept = 0;
     for at in 0..clicks.len() {
         if kept == 0 || clicks[kept - 1].click_id != clicks[at].click_id {
