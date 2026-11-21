@@ -248,6 +248,15 @@ fn sized_partitions<T>(capacity: usize) -> Vec<Vec<T>> {
 /// `[partition][thread]` buffers, each partition taken by one worker.
 type Partitioned<T> = Vec<Mutex<Vec<Vec<T>>>>;
 
+/// Partition indices, largest first: the skewed partitions (whale persons)
+/// start early instead of leaving one thread working alone at the end.
+fn largest_first<T>(parts: &Partitioned<T>) -> Vec<usize> {
+    let sizes: Vec<usize> = parts.iter().map(|part| part.lock().unwrap().iter().map(Vec::len).sum()).collect();
+    let mut order: Vec<usize> = (0..parts.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(sizes[index]));
+    order
+}
+
 /// Regroups `[thread][partition]` buffers into `[partition][thread]`.
 fn transpose<T>(states: Vec<Vec<Vec<T>>>) -> Partitioned<T> {
     let mut parts: Vec<Vec<Vec<T>>> = (0..PARTITIONS).map(|_| Vec::with_capacity(states.len())).collect();
@@ -353,7 +362,9 @@ fn location_of(partition: usize, thread: usize, index: usize) -> u64 {
 /// validation drops the event: its valid later copies are tombstoned too.
 /// Returns tombstone locations by person partition.
 fn dedup_events(copies: Partitioned<EventCopy>, threads: usize) -> Partitioned<u64> {
-    let states = par::run(threads, PARTITIONS, |_| new_partitions::<u64>(), |deletions, index| {
+    let order = largest_first(&copies);
+    let states = par::run(threads, PARTITIONS, |_| new_partitions::<u64>(), |deletions, item| {
+        let index = order[item];
         let buffers = std::mem::take(&mut *copies[index].lock().unwrap());
         let total: usize = buffers.iter().map(Vec::len).sum();
         if total == 0 {
@@ -457,11 +468,13 @@ fn sessionize(
     let organic = lookups.campaign_names.len();
     let days = window.days;
     let categories = lookups.categories.len();
+    let order = largest_first(&people);
     par::run(
         threads,
         PARTITIONS,
         |_| ThreadResult { user_days: Vec::new(), campaigns: vec![[0; 4]; (organic + 1) * days] },
-        |result, index| {
+        |result, item| {
+            let index = order[item];
             let mut buffers = std::mem::take(&mut *people[index].lock().unwrap());
             for list in std::mem::take(&mut *deletions[index].lock().unwrap()) {
                 for location in list {
