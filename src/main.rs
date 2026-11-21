@@ -471,82 +471,77 @@ fn sessionize(
             }
             // Group by person without a big sort: a dense id per person in this
             // partition, a counting sort by id, then a small sort by ts per person.
+            // The id replaces the person key inside the record (`persons` keeps it).
             let total: usize = buffers.iter().map(Vec::len).sum();
-            let mut ids: FastMap<Key, u32> = FastMap::with_capacity_and_hasher(total / 16 + 16, Default::default());
-            let mut persons: Vec<Key> = Vec::new();
+            let mut ids = DenseIds::with_capacity(total / 16 + 16);
             let mut event_starts: Vec<usize> = Vec::new(); // counts, then offsets
-            let mut event_ids: Vec<u32> = Vec::with_capacity(total);
-            for buffer in &buffers {
-                for event in buffer {
+            for buffer in buffers.iter_mut() {
+                for event in buffer.iter_mut() {
                     if event.flags & DELETED != 0 {
                         continue;
                     }
-                    let id = *ids.entry(event.person).or_insert_with(|| {
-                        persons.push(event.person);
+                    let id = ids.insert(event.person) as usize;
+                    if id == event_starts.len() {
                         event_starts.push(0);
-                        (persons.len() - 1) as u32
-                    });
-                    event_starts[id as usize] += 1;
-                    event_ids.push(id);
+                    }
+                    event_starts[id] += 1;
+                    event.person = id as Key;
                 }
             }
+            let persons = ids.keys();
             if persons.is_empty() {
                 return;
             }
-            let mut sum = 0;
-            for start in event_starts.iter_mut() {
-                let count = *start;
-                *start = sum;
-                sum += count;
-            }
+            let sum = prefix_sums(&mut event_starts);
             event_starts.push(sum);
-            let mut events: Vec<PersonEvent> = vec![PersonEvent::default(); sum];
+            let mut events: Vec<PersonEvent> = Vec::with_capacity(sum);
             let mut cursor: Vec<usize> = event_starts[..persons.len()].to_vec();
-            let mut live = event_ids.iter();
-            for buffer in &buffers {
-                for event in buffer {
+            {
+                let spare = events.spare_capacity_mut();
+                for event in buffers.iter().flatten() {
                     if event.flags & DELETED == 0 {
-                        let id = *live.next().unwrap() as usize;
-                        events[cursor[id]] = *event;
+                        let id = event.person as usize;
+                        spare[cursor[id]].write(*event);
                         cursor[id] += 1;
                     }
                 }
             }
+            // SAFETY: the counts were taken over exactly these events, so every
+            // slot in 0..sum was written once above.
+            unsafe { events.set_len(sum) };
             drop(buffers);
-            drop(event_ids);
             for person in 0..persons.len() {
                 events[event_starts[person]..event_starts[person + 1]].sort_unstable_by_key(|event| event.ts);
             }
 
             // The same grouping for clicks; clicks of people without events can
             // credit nothing and are dropped.
-            let click_buffers = std::mem::take(&mut *clicks[index].lock().unwrap());
+            let mut click_buffers = std::mem::take(&mut *clicks[index].lock().unwrap());
             let mut click_starts: Vec<usize> = vec![0; persons.len() + 1];
-            let mut click_ids: Vec<u32> = Vec::with_capacity(click_buffers.iter().map(Vec::len).sum());
-            for click in click_buffers.iter().flatten() {
-                let id = ids.get(&click.person).copied().unwrap_or(u32::MAX);
+            for click in click_buffers.iter_mut().flatten() {
+                let id = ids.get(click.person).unwrap_or(u32::MAX);
                 if id != u32::MAX {
                     click_starts[id as usize] += 1;
                 }
-                click_ids.push(id);
+                click.person = id as Key;
             }
-            let mut sum = 0;
-            for start in click_starts.iter_mut() {
-                let count = *start;
-                *start = sum;
-                sum += count;
-            }
-            let mut clicks: Vec<PersonClick> = vec![PersonClick::default(); sum];
+            let sum = prefix_sums(&mut click_starts[..persons.len()]);
+            click_starts[persons.len()] = sum;
+            let mut clicks: Vec<PersonClick> = Vec::with_capacity(sum);
             let mut cursor: Vec<usize> = click_starts[..persons.len()].to_vec();
-            for (click, &id) in click_buffers.iter().flatten().zip(&click_ids) {
-                if id != u32::MAX {
-                    clicks[cursor[id as usize]] = *click;
-                    cursor[id as usize] += 1;
+            {
+                let spare = clicks.spare_capacity_mut();
+                for click in click_buffers.iter().flatten() {
+                    if click.person != u32::MAX as Key {
+                        let id = click.person as usize;
+                        spare[cursor[id]].write(*click);
+                        cursor[id] += 1;
+                    }
                 }
             }
-            drop(click_buffers);
-            drop(click_ids);
-            // Sort each person's clicks by ts, then click_id byte-wise, and drop
+            // SAFETY: as for the events, every slot in 0..sum was written once.
+            unsafe { clicks.set_len(sum) };
+            drop(click_buffers);            // Sort each person's clicks by ts, then click_id byte-wise, and drop
             // identical copies (Clicks 2), which are now neighbours.
             let mut click_ends: Vec<usize> = vec![0; persons.len()];
             for person in 0..persons.len() {
@@ -643,6 +638,86 @@ fn sessionize(
             }
         },
     )
+}
+
+/// Turns counts into start offsets in place; returns the total.
+fn prefix_sums(counts: &mut [usize]) -> usize {
+    let mut sum = 0;
+    for count in counts.iter_mut() {
+        let value = *count;
+        *count = sum;
+        sum += value;
+    }
+    sum
+}
+
+/// Dense ids 0, 1, 2, ... for the persons of one partition: open addressing
+/// over the key hash (its low bits; the partition used the top bits), with
+/// the full key compared on every probe.
+struct DenseIds {
+    slots: Vec<u32>, // 1 + id, or 0 for empty
+    keys: Vec<Key>,
+    mask: usize,
+}
+
+impl DenseIds {
+    fn with_capacity(expected: usize) -> DenseIds {
+        let size = (expected * 2).next_power_of_two().max(64);
+        DenseIds { slots: vec![0; size], keys: Vec::with_capacity(expected), mask: size - 1 }
+    }
+
+    #[inline(always)]
+    fn insert(&mut self, key: Key) -> u32 {
+        if self.keys.len() * 2 >= self.slots.len() {
+            self.grow();
+        }
+        let mut slot = hash(key) as usize & self.mask;
+        loop {
+            let held = self.slots[slot];
+            if held == 0 {
+                self.keys.push(key);
+                self.slots[slot] = self.keys.len() as u32;
+                return self.keys.len() as u32 - 1;
+            }
+            if self.keys[held as usize - 1] == key {
+                return held - 1;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    #[inline(always)]
+    fn get(&self, key: Key) -> Option<u32> {
+        let mut slot = hash(key) as usize & self.mask;
+        loop {
+            let held = self.slots[slot];
+            if held == 0 {
+                return None;
+            }
+            if self.keys[held as usize - 1] == key {
+                return Some(held - 1);
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    #[cold]
+    fn grow(&mut self) {
+        let size = self.slots.len() * 2;
+        self.slots = vec![0; size];
+        self.mask = size - 1;
+        for (index, &key) in self.keys.iter().enumerate() {
+            let mut slot = hash(key) as usize & self.mask;
+            while self.slots[slot] != 0 {
+                slot = (slot + 1) & self.mask;
+            }
+            self.slots[slot] = index as u32 + 1;
+        }
+    }
+
+    fn keys(&self) -> Vec<Key> {
+        self.keys.clone()
+    }
 }
 
 #[derive(Default)]
