@@ -14,6 +14,9 @@ READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: links p
   - `s101-20m/` seed 101, 20M events, 5M clicks; `s102-60m/` seed 102, 60M events, 15M clicks.
 - Generator built from `../generator` (stale Cargo.lock deleted): `../generator/target/release/generate.exe`.
 
+## Local machine notes
+- 2026-11-21: another user's Python batch job (8-18 processes) saturated all CPUs for hours; the laptop later ran on battery (Balanced plan, throttled). Timings were taken as interleaved A/B comparisons; absolute numbers vary 2x between sessions.
+
 ## Decisions
 - Column order is taken as fixed by rules.md (the generator always writes the same header); the first line of each file is skipped as the header whatever it contains (fixture L3 shows a later identical line is data).
 - Input files: every regular file in the folder whose name ends `.csv` and does not start with `.`.
@@ -43,6 +46,7 @@ READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: links p
 ### Phase 3: speed (in progress)
 - Finding: on Windows, first-touch page faults of memory-mapped input cost ~2.5 s for 1.6 GB (scan itself 0.08 s); positional reads into a reused per-thread buffer take ~0.6 s. Linux faults are far cheaper, but pread is predictable on both and was adopted.
 - Finding: link maps grew by rehashing (0.5 s); replaced by a partitioned open-addressing table built in parallel, plus a bitset filter in front of the person lookup.
+- Benchmark after the outside job ended (laptop on battery, Balanced plan, search indexer busy; 3 interleaved rounds on 20M): v1 15.6 s wall / 71.6 s CPU, v5 6.4 s / 37.1 s, v7 5.4 s / 31.1 s. On mains power earlier, the v6-era build ran 2.4 s.
 - Scale cross-check (v7): the current build and v1 (an independent implementation: mmap, sort-based dedup and grouping, sequential union-find) agree exactly on 20M (2,245,672 user_daily rows) and 60M (6,614,475 rows). 60M with v7: 16.0 s on this loaded laptop, peak private 5.8 GiB.
 - Long IDs: `scripts/make_long_ids.py` lengthens a deterministic third of all IDs past 15 bytes (sharing prefixes with short ones). The differential suite now has 15 cases (13 generated + 2 long-ID variants), all MATCH.
 - v7: union by key order makes every root its set's smallest ID (no separate pass); the union-find itself runs in parallel (CAS linking of the larger-key root under the smaller; path halving). Stress test: random link files with long chains, stars, repeats, self-links and long IDs vs a sequential union-find, 30/30 repeated runs pass. Links phase 0.43-0.48 s -> 0.30-0.34 s in A/B. Unquoting is branchless (random 20% quoting made the branch mispredict).
