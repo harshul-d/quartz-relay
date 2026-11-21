@@ -1,11 +1,11 @@
-READY TO SUBMIT: v8 fa0d6d2de35482cee9c7ab7f9b56262d0153cbc4 (v7's code with neutral names; same 20M timing as v7)
+READY TO SUBMIT: v9 9a99efddab585ae755382e73e9961363e6a5ae4c (Actions, 20M, warm container median in the same job: v9 1.780 s vs v8 2.130 s on EPYC 9V74, 1.738 vs 2.103 on EPYC 9V45, 1.659 vs 1.730 on Xeon 6975P; v8 scored 1.39 s on the scorer)
 
 # Progress
 
 ## Environment (Windows 11 laptop: i5-1135G7, 4 cores / 8 threads, AVX-512, 16 GB RAM)
 - No WSL distribution installed, no Docker, no GitHub CLI. Per instructions none of these were installed.
   - The Docker image cannot be built or run locally; the Dockerfile is reviewed by hand against the scorer environment (below).
-  - The repo is committed locally only. **It still needs a public GitHub repo (quartz-relay) and a push, including tags** (`git push -u origin main --tags`).
+  - The repo is public at github.com/harshul-d/quartz-relay (origin; pushes work with stored credentials). Branches: `main` (tagged versions), `perf` (experiments, triggers the benchmark), `bench` (benchmark results only).
 - Rust: rustup via winget (stable 1.100, x86_64-pc-windows-msvc). Visual Studio Build Tools 2026 were already present, so the MSVC linker works. The `x86_64-unknown-linux-gnu` std is installed: with mimalloc temporarily removed, `cargo check --target x86_64-unknown-linux-gnu` with the Dockerfile's RUSTFLAGS type-checks all of our Linux code paths (mimalloc's C part needs the image's gcc).
 - Python 3.14.3 with pyarrow, polars, duckdb and psutil (pip --user).
 - git 2.51 with global core.autocrlf=true; `.gitattributes` (`* -text`) overrides it for this repo.
@@ -19,7 +19,7 @@ READY TO SUBMIT: v8 fa0d6d2de35482cee9c7ab7f9b56262d0153cbc4 (v7's code with neu
 Starting point: v8 scored 1.39 s on the scorer's hidden 20M practice data (leader 0.30 s, 10th ~0.59 s, 50th ~0.85 s). An independent pipeline also stalled at ~1.40 s, so the hypothesis to test is a shared floor (input reading, page faults, start-up/teardown, output) rather than parsing or session logic. Laptop timings are used for correctness only from here on; every speed decision comes from GitHub Actions.
 
 ### Benchmark setup (branch `perf`, workflow `.github/workflows/bench.yml`)
-- Runs on pushes to `perf` and on manual dispatch, on `ubuntu-latest`. Results: `results/<sha>.md` on branch `bench` (read with `git fetch origin bench; git show origin/bench:results/<sha>.md`), also in the run's step summary and as notice annotations.
+- Runs on pushes to `perf` and on manual dispatch, on `ubuntu-latest` (4 vCPU = 2 cores x 2 threads; the CPU model changes from run to run: EPYC 7763 / 9V74 / 9V45, Xeon 6975P / 6973P / 8573C seen). Three identical shards per push (matrix), so one push covers several machine types; compare variants only within one shard. Results: `results/<sha>-<shard>.md` on branch `bench` (`git fetch origin bench; git show origin/bench:results/<sha>-1.md`), also in each job's step summary and as notice annotations. Shard 1 also profiles HEAD natively with `perf` (flat profile plus the hottest source lines with their text, via `ci/srclines.py`). Poll a run without login: `GET https://api.github.com/repos/harshul-d/quartz-relay/actions/runs?head_sha=<sha>`.
 - Steps: machine info and CPU flags; datasets (dev seed 1, 1M/250k; bench seed 101, 20M events / 5M clicks) generated with `tools/gen` (a copy of the generator, neutral package name `datagen`, its test module removed because it used a crate that is not shipped; output verified byte-identical to the original for seed 7) and cached with actions/cache; the scorer's image (`docker build`); the 36 fixtures and the dev answer (`ci/dev-answer`, a copy of the public dev answer) through `scripts/docker_run.sh`; then `ci/bench.py`.
 - If the runner lacks x86-64-v3 instructions the CI image is built for x86-64-v2 and the report says so; the scorer's Dockerfile is never changed for CI.
 - `ci/bench.py`: builds one image per line of `ci/variants.txt` (`name git-ref [ENV=VALUE ...]`, extra env for flag-gated experiments), one untimed warm-up run each, then 5 repetitions; in each repetition every variant (rotated order) runs cold (sync + drop_caches) and warm with the flags of `scripts/docker_run.sh` (`--cpus` = runner CPUs), then `/bin/true` in the same image cold and warm (container overhead), then natively under `/usr/bin/time -v`; plus a raw `cat` read floor. Wall = docker run start to exit. Reports median (min-max), per-phase medians from the binary's stderr, and checks each variant's 20M output against the first variant.
@@ -42,6 +42,17 @@ Run 464472a (AMD EPYC 7763, 4 vCPU = 2 cores x 2 threads, THP `madvise`), 20M se
 
 Same data: `docker run ... /bin/true` 0.166 s warm, 0.380 cold; natively the time outside main is 0.016-0.036 s; `cat` of all input 4.46 s cold (424 MB/s, no faster with 16 readers), 0.046 s warm. Native `/usr/bin/time -v`: max RSS 2.05 GB, 2,300 minor faults, user 6.9 s, system 0.5 s. First run (3e69c52, Intel Xeon 6975P, THP `always`): v8 1.72 s warm, 3.98 s cold.
 
+### v9 (9a99efd): key packing from the chunk + dictionary-encoded user_daily + read-ahead hint
+Same-job comparison, 20M, container wall medians of 5 (min-max), run 9a99efd:
+
+| Runner | v8 warm | v9 warm | v8 cold | v9 cold | v9 exit after main (warm) |
+| --- | --- | --- | --- | --- | --- |
+| EPYC 9V74 (slow disk) | 2.130 (2.106-2.136) | **1.780** (1.760-1.836) | 5.643 | 5.264 | 0.121 s (v8-era code: ~0.43) |
+| EPYC 9V45 (slow disk) | 2.103 (2.075-2.134) | **1.738** (1.664-1.760) | 5.742 | 5.426 | 0.121 s |
+| Xeon 6975P (fast disk) | 1.730 (1.709-1.736) | **1.659** (1.652-1.666) | 3.581 | 4.035 (3.54-4.31, bimodal on both) | 0.036 s |
+
+v9 phase breakdown (EPYC 9V74, container warm): lookups 0.008, ID linking 0.089, events read+parse 0.849, dedup 0.063, clicks 0.134, sessionize 0.358 (cpu-s: group events 0.61, group clicks 0.26, sessions 0.16, attribution 0.40), output writing 0.043, start 0.098, exit 0.121. Output 20.3 MB (v8: 93.3 MB). Linux fixtures and dev answer pass in all 3 shards; 20M output matches v8 in all 3; locally fixtures 36/36, dev MATCH, differential 15/15, pyarrow/DuckDB check OK, 20M/60M exact match with v1.
+
 ### Hypotheses tested
 | # | Hypothesis | Result | Decision |
 | --- | --- | --- | --- |
@@ -54,8 +65,14 @@ Same data: `docker run ... /bin/true` 0.166 s warm, 0.380 cold; natively the tim
 | H5a | Exit cost = memory teardown or exit-time handlers (5cbba27, EPYC 9V74) | Probe (touch 2 GB, exit): container exit 0.043 s. `PIPELINE_EXIT=_exit` (skip atexit, incl. mimalloc's exit collect): exit 0.42 s. `PIPELINE_EXIT=release` (purge to OS before exit): 0.39 s | Rejected: not memory, not atexit |
 | H5b | Exit cost = the container's dirty output (~93 MB) flushed when the overlay root is unmounted (overlayfs syncs the upper filesystem) | 97edf3b landed on EPYC 7763, where head's exit is only 0.07 s: 93 MB write probe exit 0.06 s, fsync of the real output inside main +0.02 s | Inconclusive (fast-exit runner). The slow exit shows on EPYC 9V74 and Xeon 6973P runners only; the workflow now runs 3 identical shards per push to cover several machine types |
 | H5b' | (same, 582bb02, 3 shards) | Shard 1 (EPYC 7763): everything exits in ~0.05 s. Shards 2 and 3 (slow-disk runners): head exit 0.435 / 0.453 s warm (1.79 s cold on shard 3); with `PIPELINE_FSYNC=1` exit 0.05 s and output writing 0.42-0.48 s instead; a probe that only writes 93 MB: exit 0.43 s, or 0.05 s + 0.49 s in main with fsync; probes touching 2 GB or reading all 1.9 GB input: exit 0.05 s | **Confirmed: `docker run` returns only once the container's dirty output is on disk** (the overlay unmount syncs the host filesystem). Cost ~4.6 ms per MB of output on those runners, cold or warm; every pipeline writing ~90 MB of PLAIN Parquet pays ~0.4 s. Fix: write fewer bytes |
-| H7 | Parse: the largest single line in the events/clicks callbacks is `bswap` in `u128::from_be_bytes` of `key::pack_short` (21% / 31% of those symbols): a store-forwarding stall (variable-length memcpy into a stack buffer, then one 16-byte load) | Fixed with `Interner::key_in(chunk, field)`: one 16-byte load from the chunk, masked to the field length (unit test against `pack_short` for every offset/length incl. chunk ends) | Candidate (ff86f5e) |
-| H8 | Output bytes: user_daily dictionary-encoded (dictionary page PLAIN + data page RLE/bit-packed indices, whichever is smaller; user_id one entry per person run, no hashing) | 20M output 93.3 MB -> 20.3 MB, 60M 272.8 -> 57.5 MB; exact match with v1 on 20M/60M; pyarrow/DuckDB/polars identical; `PIPELINE_PLAIN_OUTPUT=1` restores the old layout for A/B | Candidate (ff86f5e) |
+| H7 | Parse: the largest single line in the events/clicks callbacks is `bswap` in `u128::from_be_bytes` of `key::pack_short` (21% / 31% of those symbols): a store-forwarding stall (variable-length memcpy into a stack buffer, then one 16-byte load) | Fixed with `Interner::key_in(chunk, field)`: one 16-byte load from the chunk, masked to the field length (unit test against `pack_short` for every offset/length incl. chunk ends) | Kept (v9). ff86f5e, same job: events parse 1.079 -> 1.020 s, clicks 0.188 -> 0.163 (EPYC 7763); warm -2 to -3% on all three shards |
+| H8 | Output bytes: user_daily dictionary-encoded (dictionary page PLAIN + data page RLE/bit-packed indices, whichever is smaller; user_id one entry per person run, no hashing) | 20M output 93.3 MB -> 20.3 MB, 60M 272.8 -> 57.5 MB; exact match with v1 on 20M/60M; pyarrow/DuckDB/polars identical; `PIPELINE_PLAIN_OUTPUT=1` restores the old layout for A/B. ff86f5e, same job vs PLAIN: Xeon 8573C (slow disk) warm 2.277 -> 1.998 s, cold 5.643 -> 5.380; fast-disk runners -0.5 to -1% | Kept (v9) |
+
+### What's next (ranked by the v9 breakdown)
+1. Events read+parse (~48% of warm wall): the partition scatter in `flush` (35% of that symbol is the two 32-byte record writes to 256 x 2 streams) -> software write-combining or fewer streams; the timestamp parser (~13% of the events callback); the tokenizer's per-field unquote (`emit`, ~27% of the tokenizer).
+2. Sessionize (~20%): DenseIds probes and the counting-sort scatter in `group-events`; attribution's per-person sort and binary searches.
+3. Output (exit 0.12 s on slow disks for 20 MB): fewer bytes still (revenue/events columns), or start writeback early (`sync_file_range`) so it overlaps the rest.
+4. Dedup and ID linking (~9% together): hash-probe cache misses.
 
 ## Public clean-up (v8)
 - The public repo will be named quartz-relay. Every tracked file name and content was cleared of the event, sponsor and track names listed in the clean-up request (checked case-insensitively, allowing spaces, hyphens and underscores between word parts, with `git grep -iE` over all tracked files: no hits). They are deliberately not spelled out here.

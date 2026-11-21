@@ -29,6 +29,8 @@ It is one native Rust binary that uses every core:
 | `scripts/diff_test.py` | Differential test: many generated datasets, reference vs binary, exact match required |
 | `scripts/check_parquet.py` | Reads an output folder with pyarrow and DuckDB and checks schema, logical types and rows |
 | `scripts/bench.py`, `scripts/verify.ps1` | Timing with peak memory; the full local check (tests, fixtures, dev, differential) |
+| `.github/workflows/bench.yml`, `ci/` | Linux benchmark on GitHub Actions (pushes to `perf`): fixtures and dev answer through Docker, then cold/warm timings of the variants in `ci/variants.txt`, a phase breakdown and a `perf` profile; results go to the `bench` branch |
+| `tools/gen/` | The dataset generator used by the benchmark |
 | `PROGRESS.md` | Status, decisions, test results and timings |
 
 ## Build
@@ -45,7 +47,7 @@ DATA_DIR=/path/to/data OUTPUT_DIR=/path/to/out target/release/pipeline
 scripts/docker_run.sh /path/to/data /path/to/out    # the image, with the scorer's flags
 ```
 
-`NCPU` sets the thread count (default: all cores). Progress goes to stderr.
+`NCPU` sets the thread count (default: all cores). Progress and a per-phase timing breakdown go to stderr. Switches for A/B runs only: `PIPELINE_WILLNEED=0` (no read-ahead hint), `PIPELINE_PLAIN_OUTPUT=1` (PLAIN-only user_daily), `PIPELINE_FSYNC=1` (flush output files before exiting).
 
 ## Test
 
@@ -65,7 +67,7 @@ Rust (see `Cargo.lock` for the exact versions and transitive dependencies):
 - [memchr](https://github.com/BurntSushi/memchr): SIMD byte search (MIT / Unlicense)
 - [mimalloc](https://github.com/purpleprotocol/mimalloc_rust): Rust bindings to Microsoft's mimalloc allocator (MIT)
 
-The Parquet writer (`src/out.rs`) is hand-written: PLAIN encoding, no compression, Thrift compact metadata.
+The Parquet writer (`src/out.rs`) is hand-written: dictionary encoding with RLE/bit-packed indices for user_daily, PLAIN for campaign_daily, no compression, Thrift compact metadata.
 
 Python, for the reference and the tests only:
 
