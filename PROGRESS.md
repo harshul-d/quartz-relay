@@ -1,4 +1,4 @@
-READY TO SUBMIT: v6 b9504fc1848f7ea254601b63c070e608f2bfdcd6 (local 20M: 2.38 s median wall, 11.8 s CPU, under outside CPU load; v5-era build 3.05 s / 15.7 s in the same A/B)
+READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: links phase -30% vs v6 in A/B; whole-run times under the current outside load are 5+ s and not comparable to earlier tags)
 
 # Progress
 
@@ -43,6 +43,7 @@ READY TO SUBMIT: v6 b9504fc1848f7ea254601b63c070e608f2bfdcd6 (local 20M: 2.38 s 
 ### Phase 3: speed (in progress)
 - Finding: on Windows, first-touch page faults of memory-mapped input cost ~2.5 s for 1.6 GB (scan itself 0.08 s); positional reads into a reused per-thread buffer take ~0.6 s. Linux faults are far cheaper, but pread is predictable on both and was adopted.
 - Finding: link maps grew by rehashing (0.5 s); replaced by a partitioned open-addressing table built in parallel, plus a bitset filter in front of the person lookup.
+- v7: union by key order makes every root its set's smallest ID (no separate pass); the union-find itself runs in parallel (CAS linking of the larger-key root under the smaller; path halving). Stress test: random link files with long chains, stars, repeats, self-links and long IDs vs a sequential union-find, 30/30 repeated runs pass. Links phase 0.43-0.48 s -> 0.30-0.34 s in A/B. Unquoting is branchless (random 20% quoting made the branch mispredict).
 - v6: the person lookup was the biggest single parse cost (skipping it: 19 s -> 10 s single-threaded parse). Each hit took three dependent cache misses (slot, key, name) and the scatter writes evict the filter and table. Now: flat (key, name) slots (one miss per hit) and rows resolved in batches of 32 with software prefetch of filter word, then slot. A/B: 3.05 -> 2.72 (flat) -> 2.38 s (batched); CPU 15.7 -> 11.8 s. Partitions are processed largest-first in dedup and sessionize (whale persons).
 - v5: mimalloc `purge_delay = -1` set at startup via `mi_option_set` (kernel CPU time -1.5 s per 20M run here: freed pages are reused instead of re-faulted). 60M peak private memory 8.2 GiB with it (was 7.1). Grouping: custom dense-id table, id stored in the record, no zero-fill; group-events cost -25% relative.
 - v4: timestamp fast path (all digits checked at once, month-start table, 8-digit SWAR for F3) checked against the plain parser on 400k random inputs; partition buffers pre-sized from input bytes (no regrowth copies). A/B vs v3, 5 interleaved rounds: median wall 7.22 s vs 8.48 s, CPU 23.0 s vs 26.7 s (machine heavily loaded).
@@ -61,6 +62,7 @@ READY TO SUBMIT: v6 b9504fc1848f7ea254601b63c070e608f2bfdcd6 (local 20M: 2.38 s 
 | v4 | v3 -15% (A/B) | - | SWAR/table timestamp parser, pre-sized partition buffers |
 | v5 | 3.85 s* | 44.8 s (disk-bound, loaded) | mimalloc purge disabled (reuse faulted pages), dense-id grouping with in-record ids |
 | v6 | 2.38 s* | - | flat (key, name) link table + batched prefetching person lookups; largest partitions first |
+| v7 | (loaded) | - | parallel CAS union-find (roots = smallest key), branchless unquote |
 
 \* From v2 on, another user's 8-process Python job shares this laptop's CPU, so absolute times are inflated and noisy; versions are compared A/B interleaved under the same load (v1 measured 7.3-7.7 s alongside v2).
 
