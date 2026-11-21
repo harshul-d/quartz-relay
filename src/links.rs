@@ -288,14 +288,27 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
         let end = names.bases.get(part + 1).map_or(count, |&base| base as usize);
         names.bases[part] as usize..end
     };
-    let most = (0..PARTITIONS)
-        .map(|part| linked_in(part).filter(|&x| person_names[x] != names.keys[x]).count())
-        .max()
-        .unwrap_or(0);
+    let counts: Vec<usize> = {
+        let counted = par::run(threads, PARTITIONS, |_| Vec::new(), |out: &mut Vec<(usize, usize)>, part| {
+            out.push((part, linked_in(part).filter(|&x| person_names[x] != names.keys[x]).count()));
+        });
+        let mut counts = vec![0; PARTITIONS];
+        for (part, n) in counted.into_iter().flatten() {
+            counts[part] = n;
+        }
+        counts
+    };
+    let most = counts.iter().copied().max().unwrap_or(0);
     let range = (most + most / 2 + 1).next_power_of_two().max(2);
     let table_bits = (range * PARTITIONS).trailing_zeros();
     let range_mask = range - 1;
     let mut table: Vec<(Key, Key)> = vec![(0, 0); range * PARTITIONS];
+
+    // 6. The filter over the same keys, filled in the same parallel pass.
+    let linked: usize = counts.iter().sum();
+    let bits = (linked * 16).next_power_of_two().max(1 << 16);
+    let filter_mask = bits as u64 - 1;
+    let filter: Vec<std::sync::atomic::AtomicU64> = (0..bits / 64).map(|_| Default::default()).collect();
     {
         let ranges: Vec<Mutex<&mut [(Key, Key)]>> = table.chunks_mut(range).map(Mutex::new).collect();
         par::run(threads, PARTITIONS, |_| (), |_, part| {
@@ -305,26 +318,18 @@ pub fn build(data: &Path, interner: &Interner, threads: usize, chunk_bytes: u64)
                 if key == name {
                     continue;
                 }
-                let mut slot = (hash(key) >> (64 - table_bits)) as usize & range_mask;
+                let hashed = hash(key);
+                let mut slot = (hashed >> (64 - table_bits)) as usize & range_mask;
                 while slots[slot].0 != 0 {
                     slot = (slot + 1) & range_mask;
                 }
                 slots[slot] = (key, name);
+                let bit = filter_bit(hashed, filter_mask);
+                filter[(bit >> 6) as usize].fetch_or(1 << (bit & 63), Ordering::Relaxed);
             }
         });
     }
-
-    // 6. The filter over the same keys.
-    let linked = (0..count).filter(|&x| person_names[x] != names.keys[x]).count();
-    let bits = (linked * 16).next_power_of_two().max(1 << 16);
-    let mut filter = vec![0u64; bits / 64];
-    let filter_mask = bits as u64 - 1;
-    for x in 0..count {
-        if person_names[x] != names.keys[x] {
-            let bit = filter_bit(hash(names.keys[x]), filter_mask);
-            filter[(bit >> 6) as usize] |= 1 << (bit & 63);
-        }
-    }
+    let filter: Vec<u64> = filter.into_iter().map(|word| word.into_inner()).collect();
     Names { table, table_bits, range_mask, filter, filter_mask }
 }
 /// Byte-wise comparison of two keys while the interner is still open.
