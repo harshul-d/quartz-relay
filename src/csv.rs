@@ -124,24 +124,20 @@ fn masks(block: &[u8; 64]) -> (u64, u64, u64) {
 #[inline(always)]
 fn emit<const N: usize>(bytes: &[u8], spans: &[(usize, usize); N], quotes: u32, each: &mut impl FnMut(&[&[u8]; N])) {
     let mut values: [&[u8]; N] = [&[]; N];
-    if quotes == 0 {
-        for k in 0..N {
-            values[k] = &bytes[spans[k].0..spans[k].1];
-        }
-    } else {
-        let mut wrapped = 0;
-        for k in 0..N {
-            let (start, end) = spans[k];
-            if end - start >= 2 && bytes[start] == b'"' && bytes[end - 1] == b'"' {
-                values[k] = &bytes[start + 1..end - 1];
-                wrapped += 2;
-            } else {
-                values[k] = &bytes[start..end];
-            }
-        }
-        if wrapped != quotes {
-            return;
-        }
+    // Branchless: quoting is random per field, so a branch would mispredict.
+    let mut wrapped = 0u32;
+    for k in 0..N {
+        let (start, end) = spans[k];
+        let long_enough = end - start >= 2;
+        // For a field shorter than 2 bytes these reads are clamped and ignored.
+        let first = bytes[start.min(end.saturating_sub(1)).min(bytes.len() - 1)];
+        let last = bytes[end.saturating_sub(1).min(bytes.len() - 1)];
+        let quoted = (long_enough & (first == b'"') & (last == b'"')) as usize;
+        values[k] = &bytes[start + quoted..end - quoted];
+        wrapped += 2 * quoted as u32;
+    }
+    if wrapped != quotes {
+        return;
     }
     each(&values);
 }
