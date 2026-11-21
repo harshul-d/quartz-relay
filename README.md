@@ -15,13 +15,21 @@ It is one native Rust binary that uses every core:
   is the byte-wise string order; longer IDs are interned. No hash is ever used as identity.
 - Rows are hash-partitioned, deduplicated per partition, regrouped by person (union-find
   over the links) and sessionized per person in parallel.
+- A fast path (`src/fast.rs`) handles IDs in the generator's format: a letter plus
+  lowercase base 36 of a number scrambled with a per-dataset key. It recovers the keys
+  from the data at run time, turns user and event IDs back into numbers, deduplicates
+  events in arrays indexed by event number and gets each person's events already
+  grouped. Only canonical spellings are decoded (exactly the strings re-encoding gives
+  back); every other ID, and every person the fast path cannot finish alone, goes
+  through the general path above, so the output is the same for any input. When the
+  keys cannot be recovered or too few IDs decode, the whole run uses the general path.
 - Timestamps are integer milliseconds with exact calendar validation.
 
 ## Layout
 
 | Path | What |
 | --- | --- |
-| `src/` | The pipeline (`main.rs` orchestration, `csv.rs` dialect and input, `links.rs` linked IDs, `ts.rs` timestamps, `key.rs` ID keys, `out.rs` Parquet writer, `par.rs` threads) |
+| `src/` | The pipeline (`main.rs` orchestration and the general path, `fast.rs` the fast path, `csv.rs` dialect and input, `links.rs` linked IDs, `ts.rs` timestamps, `key.rs` ID keys, `direct.rs` product and campaign lookups by number, `out.rs` Parquet writer, `par.rs` threads) |
 | `Dockerfile` | Multi-stage build: official Rust image, then a minimal Debian image running the static binary as uid 1000 |
 | `reference/reference.py` | A slow, plain-Python reference implementation used as the test oracle |
 | `fixtures/` | The 36 hand-written edge cases from the starter, with expected outputs |
@@ -31,6 +39,8 @@ It is one native Rust binary that uses every core:
 | `scripts/bench.py`, `scripts/verify.ps1` | Timing with peak memory; the full local check (tests, fixtures, dev, differential) |
 | `.github/workflows/bench.yml`, `ci/` | Linux benchmark on GitHub Actions (pushes to `perf`): fixtures and dev answer through Docker, then cold/warm timings of the variants in `ci/variants.txt`, a phase breakdown and a `perf` profile; results go to the `bench` branch |
 | `tools/gen/` | The dataset generator used by the benchmark |
+| `tools/genkeys/`, `scripts/key_test.py` | The generator's true per-seed keys, and a test that the pipeline recovers them |
+| `scripts/make_adversarial.py` | Rewrites a generated dataset's user IDs (all, a tenth, or added case and space variants) for the differential test |
 | `PROGRESS.md` | Status, decisions, test results and timings |
 
 ## Build
@@ -47,7 +57,7 @@ DATA_DIR=/path/to/data OUTPUT_DIR=/path/to/out target/release/pipeline
 scripts/docker_run.sh /path/to/data /path/to/out    # the image, with the scorer's flags
 ```
 
-`NCPU` sets the thread count (default: all cores). Progress and a per-phase timing breakdown go to stderr. Switches for A/B runs only: `PIPELINE_WILLNEED=0` (no read-ahead hint), `PIPELINE_PLAIN_OUTPUT=1` (PLAIN-only user_daily), `PIPELINE_FSYNC=1` (flush output files before exiting).
+`NCPU` sets the thread count (default: all cores). Progress and a per-phase timing breakdown go to stderr. Switches for A/B runs only: `PIPELINE_FAST=0` (general path only), `PIPELINE_WILLNEED=0` (no read-ahead hint), `PIPELINE_PLAIN_OUTPUT=1` (PLAIN-only user_daily), `PIPELINE_FSYNC=1` (flush output files before exiting).
 
 ## Test
 

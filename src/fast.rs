@@ -187,6 +187,17 @@ fn decode_word(word: u64, n: usize) -> Option<u64> {
     (value <= MASK).then_some(value)
 }
 
+#[inline(always)]
+fn prefetch<T>(item: &T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetching is a hint and never faults; the pointer is valid anyway.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch(item as *const T as *const i8, std::arch::x86_64::_MM_HINT_T0);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = item;
+}
+
 /// A user number (person << 9 | alias) the fast path handles: an ordinary
 /// person's alias with person below `persons`.
 #[inline(always)]
@@ -415,8 +426,6 @@ fn recover_keys(files: &Files, chunks: &[csv::Chunk], linked: &Linked) -> Result
 
 // -------------------------------------------------------------- records
 
-/// Event numbers per shard: dedup's array (16 bytes a slot) stays in L2.
-const SHARD_BITS: u32 = 16;
 
 /// One event copy, in its number's shard. `ts` is ms after window start, or
 /// NO_TS for a copy that failed validation (it still takes part in dedup).
@@ -536,6 +545,7 @@ pub fn prepare(
     lookups: &Lookups,
     window: &Window,
     threads: usize,
+    log: &dyn Fn(&str),
 ) -> Option<Prepared> {
     if std::env::var_os("PIPELINE_FAST").is_some_and(|v| v == "0") {
         return off("disabled");
@@ -549,9 +559,9 @@ pub fn prepare(
     if lookups.categories.len() > 255 {
         return off("too many categories");
     }
-    let begin = Instant::now();
     let files = Files::open_folder(&data.join("events"));
     let chunks = files.chunks(chunk_bytes());
+    let begin = Instant::now();
     let keys = match recover_keys(&files, &chunks, &linked) {
         Ok(keys) => keys,
         Err(reason) => return off(&reason),
@@ -565,118 +575,24 @@ pub fn prepare(
         begin.elapsed().as_secs_f64()
     );
     let persons = keys.persons as usize;
+    let shard_bits = shard_bits();
 
     // ---- Links: which persons are simple (their linked aliases form one
-    // set holding nothing else).
-    let (link_root, link_aliases) = classify_links(&linked, &keys, threads);
+    // set holding nothing else). Only the clicks need this, so one thread
+    // works it out while the others parse the events.
+    let classified = std::thread::scope(|scope| {
+        let classify = scope.spawn(|| {
+            let begin = Instant::now();
+            let classified = classify_links(&linked, &keys, 1);
+            eprintln!("fast-path: links classified in {:.3}s", begin.elapsed().as_secs_f64());
+            classified
+        });
+        let parsed = parse_events(&files, &chunks, interner, lookups, window, threads, &keys, shard_bits);
+        (classify.join().unwrap(), parsed)
+    });
+    let ((link_root, link_aliases), states) = classified;
     let linked_keys = linked.keys;
-
-    // ---- Events: every copy into its number's shard.
-    let shards = ((keys.events >> SHARD_BITS) + 1) as usize;
-    let capacity = keys.rows_estimate / shards / threads.max(1) * 5 / 4 + 64;
-    let ingest_base = window.start.div_euclid(1000) - (1 << 31);
-    struct EventState {
-        thread: usize,
-        shards: Vec<Vec<EventRecord>>,
-        odd: Vec<OddEvent>,
-        others: Vec<Key>,
-        dates: ts::Parser,
-        rows: usize,
-        abort: Option<&'static str>,
-    }
-    let states = par::run(
-        threads,
-        chunks.len(),
-        |thread| EventState {
-            thread,
-            shards: (0..shards).map(|_| Vec::with_capacity(capacity)).collect(),
-            odd: Vec::new(),
-            others: Vec::new(),
-            dates: ts::Parser::default(),
-            rows: 0,
-            abort: None,
-        },
-        |state, index| {
-            files.with_chunk(&chunks[index], |bytes| {
-                for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
-                    if event_id.is_empty() {
-                        return;
-                    }
-                    state.rows += 1;
-                    let ingest_ms = state.dates.parse(ingest_text);
-                    let ingest = match ingest_ms {
-                        // Sorts last, as i64::MAX does in `parse_events`.
-                        None => u32::MAX,
-                        Some(ms) => {
-                            let seconds = ms.div_euclid(1000) - ingest_base;
-                            if ms.rem_euclid(1000) != 0 || !(0..u32::MAX as i64).contains(&seconds) {
-                                state.abort = Some("an ingest_ts that is not whole seconds near the window");
-                                return;
-                            }
-                            seconds as u32
-                        }
-                    };
-                    let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
-                    let (mut ts_offset, mut user_ref, mut info) = (NO_TS, NO_USER, 0u32);
-                    // Events 3-4, exactly as `parse_events`.
-                    'validate: {
-                        if user.is_empty() || product.is_empty() {
-                            break 'validate;
-                        }
-                        let Some(ts) = state.dates.parse(ts_text) else { break 'validate };
-                        if ts < window.start || ts >= window.end {
-                            break 'validate;
-                        }
-                        let purchase = match event_type {
-                            b"view" | b"cart" => false,
-                            b"purchase" => true,
-                            _ => break 'validate,
-                        };
-                        let mut row_info = 0;
-                        if purchase {
-                            let Some(price) = ts::price(price_text) else { break 'validate };
-                            let category =
-                                lookups.products.get(product, || interner.key_in(bytes, product)).unwrap_or(lookups.unknown);
-                            row_info = price | (category as u32) << 24;
-                        }
-                        if ingest_ms.saturating_sub(ts) > LATE_LIMIT {
-                            break 'validate;
-                        }
-                        user_ref = match dense_user(decode_in(bytes, user, b'u'), keys.user, keys.persons) {
-                            Some(v) => v,
-                            None => {
-                                if state.others.len() >= (1 << OTHER_SHIFT) - 1 {
-                                    state.abort = Some("too many user IDs that do not decode");
-                                    return;
-                                }
-                                state.others.push(interner.key_in(bytes, user));
-                                OTHER | (state.thread as u32) << OTHER_SHIFT | (state.others.len() - 1) as u32
-                            }
-                        };
-                        ts_offset = (ts - window.start) as u32;
-                        info = row_info;
-                    }
-                    let number = decode_in(bytes, event_id, b'e').map(|y| unscramble(y, keys.event)).filter(|&i| i < keys.events);
-                    match number {
-                        Some(number) => state.shards[(number >> SHARD_BITS) as usize].push(EventRecord {
-                            number: number as u32,
-                            ingest,
-                            ts: ts_offset,
-                            user: user_ref,
-                            info,
-                        }),
-                        None => state.odd.push(OddEvent {
-                            event_id: interner.key_in(bytes, event_id),
-                            ingest,
-                            ts: ts_offset,
-                            user: user_ref,
-                            info,
-                        }),
-                    }
-                });
-            });
-        },
-    );
+    let shards = ((keys.events >> shard_bits) + 1) as usize;
     if let Some(reason) = states.iter().find_map(|state| state.abort) {
         return off(reason);
     }
@@ -695,7 +611,7 @@ pub fn prepare(
         by_thread.push(state.shards);
     }
     let copies = transpose_shards(by_thread, shards);
-    eprintln!("{:>8.3}s fast-path events parsed", begin.elapsed().as_secs_f64());
+    log("events parsed");
 
     // ---- Dedup (Events 2) per shard by number, then mark where each
     // person's events are. The kept copy of a number is its smallest ingest;
@@ -712,7 +628,7 @@ pub fn prepare(
     par::run(
         threads,
         shards,
-        |_| vec![[u32::MAX; 4]; 1 << SHARD_BITS],
+        |_| vec![[u32::MAX; 4]; 1 << shard_bits],
         |slots, shard| {
             let buffers = std::mem::take(&mut *copies[shard].lock().unwrap());
             if buffers.iter().all(Vec::is_empty) {
@@ -721,7 +637,7 @@ pub fn prepare(
             for slot in slots.iter_mut() {
                 slot[0] = u32::MAX;
             }
-            let base = (shard as u32) << SHARD_BITS;
+            let base = (shard as u32) << shard_bits;
             for buffer in &buffers {
                 for copy in buffer {
                     let slot = &mut slots[(copy.number - base) as usize];
@@ -733,7 +649,7 @@ pub fn prepare(
                 }
             }
             drop(buffers);
-            let mut kept = Vec::with_capacity(1 << SHARD_BITS);
+            let mut kept = Vec::with_capacity(1 << shard_bits);
             for slot in slots.iter() {
                 if slot[0] != u32::MAX && slot[1] != NO_TS {
                     kept.push(Survivor { ts: slot[1], user: slot[2], info: slot[3] });
@@ -782,7 +698,14 @@ pub fn prepare(
             home[(survivor.user >> ALIAS_BITS) as usize].store(HOME_MULTI, Relaxed);
         }
     }
-    eprintln!("{:>8.3}s fast-path events deduplicated", begin.elapsed().as_secs_f64());
+    // A person who is not simple is finished on the general path too: one
+    // lookup then answers both questions for every click.
+    for (at, &root) in home.iter().zip(&link_root) {
+        if root == LINK_COMPLEX {
+            at.store(HOME_MULTI, Relaxed);
+        }
+    }
+    log("events deduplicated");
 
     // ---- Clicks (1 and 3, as `parse_clicks`): a person finished in one
     // shard gets their clicks there; everyone else's go to the general path
@@ -793,14 +716,33 @@ pub fn prepare(
     struct ClickState {
         local: Vec<Vec<LocalClick>>,
         general: Vec<Vec<PersonClick>>,
+        /// Clicks of decoded users whose `home` entry is being prefetched.
+        pending: Vec<LocalClick>,
         dates: ts::Parser,
     }
+    /// Clicks waiting in `pending` while their `home` entries load.
+    const AHEAD: usize = 16;
+    let user_key = keys.user;
+    let route = |state: &mut ClickState| {
+        for click in state.pending.drain(..) {
+            let at = home[(click.user >> ALIAS_BITS) as usize].load(Relaxed);
+            if at == HOME_MULTI {
+                // The ID is canonical, so this is its exact key.
+                let person = names.person(encode(b'u', scramble(click.user as u64, user_key)));
+                let LocalClick { click_id, ts, campaign, .. } = click;
+                state.general[partition(person)].push(PersonClick { person, click_id, ts, campaign });
+            } else if at != HOME_NONE {
+                state.local[at as usize].push(click);
+            } // HOME_NONE: none of this person's IDs has an event
+        }
+    };
     let states = par::run(
         threads,
         chunks.len(),
         |_| ClickState {
             local: (0..shards).map(|_| Vec::with_capacity(local_capacity)).collect(),
             general: new_partitions(),
+            pending: Vec::with_capacity(AHEAD),
             dates: ts::Parser::default(),
         },
         |state, index| {
@@ -816,19 +758,18 @@ pub fn prepare(
                     let Some(campaign) = lookups.campaigns.get(campaign, || interner.key_in(bytes, campaign)) else { return };
                     let click_id = interner.key_in(bytes, click_id);
                     if let Some(v) = dense_user(decode_in(bytes, user, b'u'), keys.user, keys.persons) {
-                        let person = (v >> ALIAS_BITS) as usize;
-                        let at = home[person].load(Relaxed);
-                        if link_root[person] != LINK_COMPLEX && at != HOME_MULTI {
-                            if at != HOME_NONE {
-                                state.local[at as usize].push(LocalClick { click_id, ts, user: v, campaign });
-                            }
-                            return; // HOME_NONE: none of this person's IDs has an event
+                        prefetch(&home[(v >> ALIAS_BITS) as usize]);
+                        state.pending.push(LocalClick { click_id, ts, user: v, campaign });
+                        if state.pending.len() == AHEAD {
+                            route(state);
                         }
+                        return;
                     }
                     let person = names.person(interner.key_in(bytes, user));
                     state.general[partition(person)].push(PersonClick { person, click_id, ts, campaign });
                 });
             });
+            route(state);
         },
     );
     let mut local_clicks = Vec::with_capacity(states.len());
@@ -839,7 +780,7 @@ pub fn prepare(
     }
     stats.clicks_local = local_clicks.iter().flatten().map(Vec::len).sum();
     stats.clicks_general = general.iter().flatten().map(Vec::len).sum();
-    eprintln!("{:>8.3}s fast-path clicks parsed", begin.elapsed().as_secs_f64());
+    log("clicks parsed");
 
     Some(Prepared {
         keys,
@@ -854,6 +795,135 @@ pub fn prepare(
         general_clicks: transpose(general),
         stats,
     })
+}
+
+/// Event numbers per dedup shard: 2^16 by default (the 16-byte slots then
+/// stay in L2); `PIPELINE_SHARD_BITS` (14 to 20) overrides it for A/B runs.
+fn shard_bits() -> u32 {
+    std::env::var("PIPELINE_SHARD_BITS").ok().and_then(|v| v.parse().ok()).filter(|b| (14..=20).contains(b)).unwrap_or(16)
+}
+
+/// One parsing thread's events.
+struct EventState {
+    thread: usize,
+    shards: Vec<Vec<EventRecord>>,
+    odd: Vec<OddEvent>,
+    others: Vec<Key>,
+    dates: ts::Parser,
+    rows: usize,
+    abort: Option<&'static str>,
+}
+
+/// Events 1 and 3-4 for every line, as `parse_events` in main.rs: each copy,
+/// valid or not, into its event number's shard.
+fn parse_events(
+    files: &Files,
+    chunks: &[csv::Chunk],
+    interner: &Interner,
+    lookups: &Lookups,
+    window: &Window,
+    threads: usize,
+    keys: &Keys,
+    shard_bits: u32,
+) -> Vec<EventState> {
+    let shards = ((keys.events >> shard_bits) + 1) as usize;
+    let capacity = keys.rows_estimate / shards / threads.max(1) * 5 / 4 + 64;
+    let ingest_base = window.start.div_euclid(1000) - (1 << 31);
+    par::run(
+        threads,
+        chunks.len(),
+        |thread| EventState {
+            thread,
+            shards: (0..shards).map(|_| Vec::with_capacity(capacity)).collect(),
+            odd: Vec::new(),
+            others: Vec::new(),
+            dates: ts::Parser::default(),
+            rows: 0,
+            abort: None,
+        },
+        |state, index| {
+            files.with_chunk(&chunks[index], |bytes| {
+                for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
+                    if event_id.is_empty() {
+                        return;
+                    }
+                    state.rows += 1;
+                    let ingest_ms = state.dates.parse(ingest_text);
+                    let ingest = match ingest_ms {
+                        // Sorts last, as i64::MAX does in `parse_events`.
+                        None => u32::MAX,
+                        Some(ms) => {
+                            // Unsigned division by a constant: a multiply.
+                            let whole = (ms as u64 / 1000) as i64;
+                            let seconds = whole - ingest_base;
+                            if ms < 0 || whole * 1000 != ms || !(0..u32::MAX as i64).contains(&seconds) {
+                                state.abort = Some("an ingest_ts that is not whole seconds near the window");
+                                return;
+                            }
+                            seconds as u32
+                        }
+                    };
+                    let ingest_ms = ingest_ms.unwrap_or(i64::MAX);
+                    let (mut ts_offset, mut user_ref, mut info) = (NO_TS, NO_USER, 0u32);
+                    // Events 3-4, exactly as `parse_events`.
+                    'validate: {
+                        if user.is_empty() || product.is_empty() {
+                            break 'validate;
+                        }
+                        let Some(ts) = state.dates.parse(ts_text) else { break 'validate };
+                        if ts < window.start || ts >= window.end {
+                            break 'validate;
+                        }
+                        let purchase = match event_type {
+                            b"view" | b"cart" => false,
+                            b"purchase" => true,
+                            _ => break 'validate,
+                        };
+                        let mut row_info = 0;
+                        if purchase {
+                            let Some(price) = ts::price(price_text) else { break 'validate };
+                            let category =
+                                lookups.products.get(product, || interner.key_in(bytes, product)).unwrap_or(lookups.unknown);
+                            row_info = price | (category as u32) << 24;
+                        }
+                        if ingest_ms.saturating_sub(ts) > LATE_LIMIT {
+                            break 'validate;
+                        }
+                        user_ref = match dense_user(decode_in(bytes, user, b'u'), keys.user, keys.persons) {
+                            Some(v) => v,
+                            None => {
+                                if state.others.len() >= (1 << OTHER_SHIFT) - 1 {
+                                    state.abort = Some("too many user IDs that do not decode");
+                                    return;
+                                }
+                                state.others.push(interner.key_in(bytes, user));
+                                OTHER | (state.thread as u32) << OTHER_SHIFT | (state.others.len() - 1) as u32
+                            }
+                        };
+                        ts_offset = (ts - window.start) as u32;
+                        info = row_info;
+                    }
+                    let number = decode_in(bytes, event_id, b'e').map(|y| unscramble(y, keys.event)).filter(|&i| i < keys.events);
+                    match number {
+                        Some(number) => state.shards[(number >> shard_bits) as usize].push(EventRecord {
+                            number: number as u32,
+                            ingest,
+                            ts: ts_offset,
+                            user: user_ref,
+                            info,
+                        }),
+                        None => state.odd.push(OddEvent {
+                            event_id: interner.key_in(bytes, event_id),
+                            ingest,
+                            ts: ts_offset,
+                            user: user_ref,
+                            info,
+                        }),
+                    }
+                });
+            });
+        },
+    )
 }
 
 /// Per person: the root their linked aliases share and which aliases are

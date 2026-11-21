@@ -16,6 +16,9 @@
 //! 5. Per person partition: drop tombstoned events, sort, sessionize, credit
 //!    and assist, and aggregate.
 //! 6. Write Parquet.
+//!
+//! When the IDs are in the generator's format, `fast.rs` replaces steps 2-4
+//! for most persons and finishes them itself; the rest go through step 5.
 
 mod csv;
 mod direct;
@@ -176,9 +179,8 @@ fn main() {
     let user_dir = out::create_dirs(&output);
     let early_dir = early.then_some(&*user_dir);
 
-    let (results, strings) = match fast::prepare(&data, &interner, &names, linked, &lookups, &window, threads) {
+    let (results, strings) = match fast::prepare(&data, &interner, &names, linked, &lookups, &window, threads, &log) {
         Some(prepared) => {
-            log("fast path parsed");
             let strings = interner.finish();
             let (mut results, people, clicks) =
                 fast::finish(prepared, &names, &lookups, &window, &strings, threads, early_dir);
