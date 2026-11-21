@@ -1,0 +1,7 @@
+fixtures/
+reference/
+data/
+target/
+out/
+dev/
+.git
