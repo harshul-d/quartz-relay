@@ -39,7 +39,7 @@ unsafe extern "C" {
 /// `mi_option_purge_delay` in mimalloc 2.x's `mi_option_e`.
 const MI_OPTION_PURGE_DELAY: i32 = 15;
 
-use csv::{Files, for_each_line, split};
+use csv::{Files, for_each_line, for_each_record, split};
 use key::{FastMap, Interner, Key, Strings, hash};
 use ts::{DAY, HOUR, MINUTE};
 
@@ -371,103 +371,6 @@ fn parse_events(
         }
         state.pending.clear();
     }
-    /// One event line, decoded field by field as the tokenizer cuts it
-    /// (Events 1 and 3-4 run at the line's end).
-    struct EventSink<'a, 's> {
-        state: &'s mut State,
-        bytes: &'a [u8],
-        interner: &'s Interner,
-        names: &'s links::Names,
-        lookups: &'s Lookups,
-        window: &'s Window,
-        /// Key of the event_id; 0 = empty.
-        event_id: Key,
-        user: &'a [u8],
-        ts: Option<i64>,
-        ingest: i64,
-        kind: u8,
-        product: &'a [u8],
-        price: &'a [u8],
-    }
-    const VIEW_OR_CART: u8 = 0;
-    const PURCHASE_TYPE: u8 = 1;
-    const BAD_TYPE: u8 = 2;
-    impl<'a> csv::FieldSink<'a> for EventSink<'a, '_> {
-        #[inline(always)]
-        fn field(&mut self, index: usize, value: &'a [u8]) {
-            match index {
-                0 => self.event_id = self.interner.key_in(self.bytes, value),
-                1 => self.user = value,
-                2 => self.ts = self.state.dates.parse(value),
-                // ingest_ts is always valid F1; were it not, the copy sorts last.
-                3 => self.ingest = self.state.dates.parse(value).unwrap_or(i64::MAX),
-                4 => {
-                    self.kind = match value {
-                        b"view" | b"cart" => VIEW_OR_CART,
-                        b"purchase" => PURCHASE_TYPE,
-                        _ => BAD_TYPE,
-                    }
-                }
-                5 => self.product = value,
-                _ => self.price = value,
-            }
-        }
-
-        #[inline(always)]
-        fn end(&mut self, complete: bool) {
-            // An incomplete line set only some fields: all are ignored.
-            if !complete || self.event_id == 0 || self.state.skip & 8 != 0 {
-                return;
-            }
-            let (event_id, ingest) = (self.event_id, self.ingest);
-            'validate: {
-                if self.user.is_empty() || self.product.is_empty() {
-                    break 'validate;
-                }
-                let Some(ts) = self.ts else { break 'validate };
-                if ts < self.window.start || ts >= self.window.end {
-                    break 'validate;
-                }
-                if self.kind == BAD_TYPE {
-                    break 'validate;
-                }
-                let purchase = self.kind == PURCHASE_TYPE;
-                let mut price = 0;
-                let mut category = 0;
-                if purchase {
-                    let Some(value) = ts::price(self.price) else { break 'validate };
-                    price = value;
-                    let product = self.interner.key_in(self.bytes, self.product);
-                    category = self.lookups.products.get(&product).copied().unwrap_or(self.lookups.unknown);
-                }
-                if ingest.saturating_sub(ts) > LATE_LIMIT {
-                    break 'validate;
-                }
-                let user = self.interner.key_in(self.bytes, self.user);
-                let hashed = hash(user);
-                self.names.prefetch_filter(hashed);
-                self.state.pending.push(Pending {
-                    user,
-                    event_id,
-                    hashed,
-                    ingest,
-                    ts,
-                    price,
-                    category,
-                    flags: if purchase { PURCHASE } else { 0 },
-                    linked: false,
-                });
-                if self.state.pending.len() == BATCH {
-                    flush(self.state, self.names);
-                }
-                return;
-            }
-            // Failed validation: only the dedup copy is kept.
-            if self.state.skip & 1 == 0 {
-                self.state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
-            }
-        }
-    }
     let states = par::run(
         threads,
         chunks.len(),
@@ -481,22 +384,60 @@ fn parse_events(
         },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
-                let mut sink = EventSink {
-                    state: &mut *state,
-                    bytes,
-                    interner,
-                    names,
-                    lookups,
-                    window,
-                    event_id: 0,
-                    user: &[],
-                    ts: None,
-                    ingest: i64::MAX,
-                    kind: BAD_TYPE,
-                    product: &[],
-                    price: &[],
-                };
-                csv::for_each_field::<7>(bytes, &mut sink);
+                for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
+                    if event_id.is_empty() || state.skip & 8 != 0 {
+                        return;
+                    }
+                    let event_id = interner.key_in(bytes, event_id);
+                    // ingest_ts is always valid F1; were it not, the copy sorts last.
+                    let ingest = state.dates.parse(ingest_text).unwrap_or(i64::MAX);
+                    'validate: {
+                        if user.is_empty() || product.is_empty() {
+                            break 'validate;
+                        }
+                        let Some(ts) = state.dates.parse(ts_text) else { break 'validate };
+                        if ts < window.start || ts >= window.end {
+                            break 'validate;
+                        }
+                        let purchase = match event_type {
+                            b"view" | b"cart" => false,
+                            b"purchase" => true,
+                            _ => break 'validate,
+                        };
+                        let mut price = 0;
+                        let mut category = 0;
+                        if purchase {
+                            let Some(value) = ts::price(price_text) else { break 'validate };
+                            price = value;
+                            category = lookups.products.get(&interner.key_in(bytes, product)).copied().unwrap_or(lookups.unknown);
+                        }
+                        if ingest.saturating_sub(ts) > LATE_LIMIT {
+                            break 'validate;
+                        }
+                        let user = interner.key_in(bytes, user);
+                        let hashed = hash(user);
+                        names.prefetch_filter(hashed);
+                        state.pending.push(Pending {
+                            user,
+                            event_id,
+                            hashed,
+                            ingest,
+                            ts,
+                            price,
+                            category,
+                            flags: if purchase { PURCHASE } else { 0 },
+                            linked: false,
+                        });
+                        if state.pending.len() == BATCH {
+                            flush(state, names);
+                        }
+                        return;
+                    }
+                    // Failed validation: only the dedup copy is kept.
+                    if state.skip & 1 == 0 {
+                        state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                    }
+                });
                 flush(state, names);
             });
         },
@@ -603,53 +544,6 @@ fn parse_clicks(
         }
         state.pending.clear();
     }
-    /// One click line, decoded field by field as the tokenizer cuts it.
-    struct ClickSink<'a, 's> {
-        state: &'s mut State,
-        bytes: &'a [u8],
-        interner: &'s Interner,
-        names: &'s links::Names,
-        lookups: &'s Lookups,
-        window: &'s Window,
-        click_id: &'a [u8],
-        user: &'a [u8],
-        campaign: &'a [u8],
-        ts: Option<i64>,
-    }
-    impl<'a> csv::FieldSink<'a> for ClickSink<'a, '_> {
-        #[inline(always)]
-        fn field(&mut self, index: usize, value: &'a [u8]) {
-            match index {
-                0 => self.click_id = value,
-                1 => self.user = value,
-                2 => self.campaign = value,
-                _ => self.ts = self.state.dates.parse(value),
-            }
-        }
-
-        #[inline(always)]
-        fn end(&mut self, complete: bool) {
-            // An incomplete line set only some fields: all are ignored.
-            if !complete || self.click_id.is_empty() || self.user.is_empty() {
-                return;
-            }
-            let Some(ts) = self.ts else { return };
-            if ts < self.window.click_start || ts >= self.window.end {
-                return;
-            }
-            let Some(&campaign) = self.lookups.campaigns.get(&self.interner.key_in(self.bytes, self.campaign)) else {
-                return;
-            };
-            let user = self.interner.key_in(self.bytes, self.user);
-            let hashed = hash(user);
-            self.names.prefetch_filter(hashed);
-            let click_id = self.interner.key_in(self.bytes, self.click_id);
-            self.state.pending.push((PersonClick { person: user, click_id, ts, campaign }, hashed, false));
-            if self.state.pending.len() == BATCH {
-                flush(self.state, self.names);
-            }
-        }
-    }
     let states = par::run(
         threads,
         chunks.len(),
@@ -660,19 +554,24 @@ fn parse_clicks(
         },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
-                let mut sink = ClickSink {
-                    state: &mut *state,
-                    bytes,
-                    interner,
-                    names,
-                    lookups,
-                    window,
-                    click_id: &[],
-                    user: &[],
-                    campaign: &[],
-                    ts: None,
-                };
-                csv::for_each_field::<4>(bytes, &mut sink);
+                for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
+                    if click_id.is_empty() || user.is_empty() {
+                        return;
+                    }
+                    let Some(ts) = state.dates.parse(ts_text) else { return };
+                    if ts < window.click_start || ts >= window.end {
+                        return;
+                    }
+                    let Some(&campaign) = lookups.campaigns.get(&interner.key_in(bytes, campaign)) else { return };
+                    let user = interner.key_in(bytes, user);
+                    let hashed = hash(user);
+                    names.prefetch_filter(hashed);
+                    let click = PersonClick { person: user, click_id: interner.key_in(bytes, click_id), ts, campaign };
+                    state.pending.push((click, hashed, false));
+                    if state.pending.len() == BATCH {
+                        flush(state, names);
+                    }
+                });
                 flush(state, names);
             });
         },

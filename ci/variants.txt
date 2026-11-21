@@ -2,7 +2,7 @@
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
 # ci/scaling.txt names the variants also run natively with 1, 2 and 4 threads.
-v10       v10
-before    3cfd50dc5296437622ea0ed0298424e5417830cb  PIPELINE_OVERLAP=0
-fusedev   3bb5ea719b347ebe37009380fc3a9ed1d30c61a8
-head      HEAD
+v8    v8
+v9    v9
+v10   v10
+head  HEAD
