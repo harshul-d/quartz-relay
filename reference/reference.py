@@ -231,13 +231,15 @@ def main():
     click_window_start = window_start - CLICK_LOOKBACK
 
     # Lookups: products.csv and campaigns.csv are clean.
+    # (Rows with an empty field are skipped; a repeated ID keeps its last row.)
     category_of = {}
-    for path in [os.path.join(data_dir, "products.csv")]:
-        for product_id, category in read_csv(path, 2):
+    for product_id, category in read_csv(os.path.join(data_dir, "products.csv"), 2):
+        if product_id is not None and category is not None:
             category_of[product_id] = category
     channel_of = {}
     for campaign_id, channel in read_csv(os.path.join(data_dir, "campaigns.csv"), 2):
-        channel_of[campaign_id] = channel
+        if campaign_id is not None and channel is not None:
+            channel_of[campaign_id] = channel
 
     # Linked IDs: an ID in no remaining link is a person on its own.
     names = build_person_names(data_dir)
