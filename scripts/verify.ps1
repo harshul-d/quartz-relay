@@ -5,6 +5,7 @@ $work = Split-Path -Parent $root
 $bin = Join-Path $root "target\release\pipeline.exe"
 Set-Location $root
 cargo build --release 2>&1 | Select-Object -Last 1
+cargo test 2>&1 | Select-String "test result|FAILED|panicked"   # debug: assertions and overflow checks on
 cargo test --release 2>&1 | Select-String "test result|FAILED"
 python scripts/run_fixtures.py fixtures -- $bin 2>&1 | Select-Object -Last 1
 $out = Join-Path $work "data\out-rs-dev"

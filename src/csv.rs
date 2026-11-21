@@ -126,15 +126,24 @@ fn emit<const N: usize>(bytes: &[u8], spans: &[(usize, usize); N], quotes: u32, 
     let mut values: [&[u8]; N] = [&[]; N];
     // Branchless: quoting is random per field, so a branch would mispredict.
     let mut wrapped = 0u32;
+    let length = bytes.len();
     for k in 0..N {
         let (start, end) = spans[k];
+        // The tokenizer guarantees start <= end <= length, and length > 0.
+        debug_assert!(start <= end && end <= length && length > 0);
         let long_enough = end - start >= 2;
         // For a field shorter than 2 bytes these reads are clamped and ignored.
-        let first = bytes[start.min(end.saturating_sub(1)).min(bytes.len() - 1)];
-        let last = bytes[end.saturating_sub(1).min(bytes.len() - 1)];
-        let quoted = (long_enough & (first == b'"') & (last == b'"')) as usize;
-        values[k] = &bytes[start + quoted..end - quoted];
-        wrapped += 2 * quoted as u32;
+        let first_at = start.min(length - 1);
+        let last_at = end.max(1) - 1;
+        // SAFETY: both indices are below `length` (see above); when `quoted`
+        // is 1 the field has at least 2 bytes, so start + 1 <= end - 1.
+        unsafe {
+            let first = *bytes.get_unchecked(first_at);
+            let last = *bytes.get_unchecked(last_at);
+            let quoted = (long_enough & (first == b'"') & (last == b'"')) as usize;
+            values[k] = bytes.get_unchecked(start + quoted..end - quoted);
+            wrapped += 2 * quoted as u32;
+        }
     }
     if wrapped != quotes {
         return;
