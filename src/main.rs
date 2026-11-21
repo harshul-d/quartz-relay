@@ -48,7 +48,7 @@ const LATE_LIMIT: i64 = 24 * HOUR;
 const LOOKBACK: i64 = 7 * DAY;
 
 /// Records are spread over this many hash partitions (a power of two).
-const PARTITION_BITS: u32 = 8;
+const PARTITION_BITS: u32 = 7;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
 const CHUNK_BYTES: u64 = 2 << 20;
 
