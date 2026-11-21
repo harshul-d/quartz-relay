@@ -39,7 +39,7 @@ unsafe extern "C" {
 /// `mi_option_purge_delay` in mimalloc 2.x's `mi_option_e`.
 const MI_OPTION_PURGE_DELAY: i32 = 15;
 
-use csv::{Files, for_each_line, for_each_record, split};
+use csv::{Files, for_each_line, split};
 use key::{FastMap, Interner, Key, Strings, hash};
 use ts::{DAY, HOUR, MINUTE};
 
@@ -603,6 +603,53 @@ fn parse_clicks(
         }
         state.pending.clear();
     }
+    /// One click line, decoded field by field as the tokenizer cuts it.
+    struct ClickSink<'a, 's> {
+        state: &'s mut State,
+        bytes: &'a [u8],
+        interner: &'s Interner,
+        names: &'s links::Names,
+        lookups: &'s Lookups,
+        window: &'s Window,
+        click_id: &'a [u8],
+        user: &'a [u8],
+        campaign: &'a [u8],
+        ts: Option<i64>,
+    }
+    impl<'a> csv::FieldSink<'a> for ClickSink<'a, '_> {
+        #[inline(always)]
+        fn field(&mut self, index: usize, value: &'a [u8]) {
+            match index {
+                0 => self.click_id = value,
+                1 => self.user = value,
+                2 => self.campaign = value,
+                _ => self.ts = self.state.dates.parse(value),
+            }
+        }
+
+        #[inline(always)]
+        fn end(&mut self, complete: bool) {
+            // An incomplete line set only some fields: all are ignored.
+            if !complete || self.click_id.is_empty() || self.user.is_empty() {
+                return;
+            }
+            let Some(ts) = self.ts else { return };
+            if ts < self.window.click_start || ts >= self.window.end {
+                return;
+            }
+            let Some(&campaign) = self.lookups.campaigns.get(&self.interner.key_in(self.bytes, self.campaign)) else {
+                return;
+            };
+            let user = self.interner.key_in(self.bytes, self.user);
+            let hashed = hash(user);
+            self.names.prefetch_filter(hashed);
+            let click_id = self.interner.key_in(self.bytes, self.click_id);
+            self.state.pending.push((PersonClick { person: user, click_id, ts, campaign }, hashed, false));
+            if self.state.pending.len() == BATCH {
+                flush(self.state, self.names);
+            }
+        }
+    }
     let states = par::run(
         threads,
         chunks.len(),
@@ -613,24 +660,19 @@ fn parse_clicks(
         },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
-                for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
-                    if click_id.is_empty() || user.is_empty() {
-                        return;
-                    }
-                    let Some(ts) = state.dates.parse(ts_text) else { return };
-                    if ts < window.click_start || ts >= window.end {
-                        return;
-                    }
-                    let Some(&campaign) = lookups.campaigns.get(&interner.key_in(bytes, campaign)) else { return };
-                    let user = interner.key_in(bytes, user);
-                    let hashed = hash(user);
-                    names.prefetch_filter(hashed);
-                    let click = PersonClick { person: user, click_id: interner.key_in(bytes, click_id), ts, campaign };
-                    state.pending.push((click, hashed, false));
-                    if state.pending.len() == BATCH {
-                        flush(state, names);
-                    }
-                });
+                let mut sink = ClickSink {
+                    state: &mut *state,
+                    bytes,
+                    interner,
+                    names,
+                    lookups,
+                    window,
+                    click_id: &[],
+                    user: &[],
+                    campaign: &[],
+                    ts: None,
+                };
+                csv::for_each_field::<4>(bytes, &mut sink);
                 flush(state, names);
             });
         },
