@@ -170,7 +170,13 @@ fn main() {
     let lookups = read_lookups(&data, &interner);
     log("lookups");
 
+    // The fast path's sample of event rows is read while the links are.
+    let sampler = std::thread::spawn({
+        let data = data.clone();
+        move || fast::sample_events(&data)
+    });
     let linked = links::build_linked(&data, &interner, threads, chunk_bytes());
+    let sample = sampler.join().expect("sampling thread");
     log("links");
 
     // `PIPELINE_EARLY_WRITE=0` (A/B only): write everything at the end, no writeback hints.
@@ -179,7 +185,7 @@ fn main() {
     let user_dir = out::create_dirs(&output);
     let early_dir = early.then_some(&*user_dir);
 
-    let (results, strings) = match fast::prepare(&data, &interner, linked, &lookups, &window, threads, &log) {
+    let (results, strings) = match fast::prepare(&data, sample, &interner, linked, &lookups, &window, threads, &log) {
         Ok(prepared) => {
             let mut strings = interner.finish();
             strings.set_resolver(prepared.resolver());

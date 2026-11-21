@@ -322,19 +322,39 @@ struct Keys {
     rows_estimate: usize,
 }
 
-/// Recovers both keys from samples of the link pairs and the event files.
-fn recover_keys(files: &Files, chunks: &[csv::Chunk], linked: &Linked) -> Result<Keys, String> {
-    // Event rows from the start of up to 96 chunks across the files.
+/// The event files cut into chunks, and (event_id, user_id) as decoded base
+/// 36 from rows at the start of up to 96 chunks across them. Needs nothing
+/// from the links, so main runs it on its own thread while they are read.
+pub struct EventSample {
+    files: Files,
+    chunks: Vec<csv::Chunk>,
+    rows: Vec<(Option<u64>, Option<u64>)>,
+    bytes: usize,
+    seconds: f64,
+}
+
+pub fn sample_events(data: &Path) -> EventSample {
+    let begin = Instant::now();
+    let files = Files::open_folder(&data.join("events"));
+    let chunks = files.chunks(chunk_bytes());
     let step = (chunks.len() / 96).max(1);
-    let mut sample: Vec<(Option<u64>, Option<u64>)> = Vec::new();
-    let mut sampled_bytes = 0usize;
-    for chunk in chunks.iter().step_by(step) {
-        let head = files.head(chunk, 64 << 10);
-        sampled_bytes += head.len();
-        for_each_record::<7>(&head, |fields| {
-            sample.push((decode_bytes(fields[0], b'e'), decode_bytes(fields[1], b'u')));
-        });
+    let mut rows: Vec<(Option<u64>, Option<u64>)> = Vec::new();
+    let mut bytes = 0usize;
+    if std::env::var_os("PIPELINE_FAST").is_none_or(|v| v != "0") {
+        for chunk in chunks.iter().step_by(step) {
+            let head = files.head(chunk, 64 << 10);
+            bytes += head.len();
+            for_each_record::<7>(&head, |fields| {
+                rows.push((decode_bytes(fields[0], b'e'), decode_bytes(fields[1], b'u')));
+            });
+        }
     }
+    EventSample { files, chunks, rows, bytes, seconds: begin.elapsed().as_secs_f64() }
+}
+
+/// Recovers both keys from samples of the link pairs and the event files.
+fn recover_keys(sampled: &EventSample, linked: &Linked) -> Result<Keys, String> {
+    let (files, sample, sampled_bytes) = (&sampled.files, &sampled.rows, sampled.bytes);
     if sample.is_empty() {
         return Err("no event rows sampled".into());
     }
@@ -544,6 +564,7 @@ fn off(reason: &str, linked: Linked) -> Result<Prepared, Linked> {
 /// clicks. None when the fast path cannot be used (nothing is kept then).
 pub fn prepare(
     data: &Path,
+    sample: EventSample,
     interner: &Interner,
     linked: Linked,
     lookups: &Lookups,
@@ -563,21 +584,22 @@ pub fn prepare(
     if lookups.categories.len() > 255 {
         return off("too many categories", linked);
     }
-    let files = Files::open_folder(&data.join("events"));
-    let chunks = files.chunks(chunk_bytes());
     let begin = Instant::now();
-    let keys = match recover_keys(&files, &chunks, &linked) {
+    let keys = match recover_keys(&sample, &linked) {
+
         Ok(keys) => keys,
         Err(reason) => return off(&reason, linked),
     };
     eprintln!("fast-path keys user=0x{:x} event=0x{:x}", keys.user, keys.event);
     eprintln!(
-        "fast-path: ~{} event rows, {} persons, {} event numbers, keys in {:.3}s",
+        "fast-path: ~{} event rows, {} persons, {} event numbers; sampled in {:.3}s (beside the links), keys in {:.3}s",
         keys.rows_estimate,
         keys.persons,
         keys.events,
+        sample.seconds,
         begin.elapsed().as_secs_f64()
     );
+    let EventSample { files, chunks, .. } = sample;
     let persons = keys.persons as usize;
     let shard_bits = shard_bits();
 
