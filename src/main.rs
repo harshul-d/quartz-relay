@@ -35,6 +35,8 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 unsafe extern "C" {
     /// From the statically linked mimalloc (mimalloc.h).
     fn mi_option_set(option: i32, value: std::ffi::c_long);
+    fn mi_collect(force: bool);
+    fn _exit(code: i32) -> !;
 }
 /// `mi_option_purge_delay` in mimalloc 2.x's `mi_option_e`.
 const MI_OPTION_PURGE_DELAY: i32 = 15;
@@ -137,6 +139,20 @@ fn main() {
     unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1) };
     let begin = Instant::now();
     timing::epoch("main-start");
+    let exit_mode = std::env::var("PIPELINE_EXIT").unwrap_or_default();
+    if let Some(megabytes) = std::env::var("PIPELINE_PROBE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
+        // Experiment probe: touch this much fresh memory, then exit without work.
+        let mut block = vec![0u8; megabytes << 20];
+        for page in block.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        std::hint::black_box(&block);
+        eprintln!("{:>8.3}s probe touched {megabytes} MB", begin.elapsed().as_secs_f64());
+        std::mem::forget(block);
+        eprintln!("{:>8.3}s end of main", begin.elapsed().as_secs_f64());
+        timing::epoch("main-end");
+        return;
+    }
     let data = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let output = PathBuf::from(std::env::var("OUTPUT_DIR").unwrap_or_else(|_| "/output".into()));
     let threads = std::env::var("NCPU")
@@ -173,8 +189,22 @@ fn main() {
     timing::report();
     eprintln!("threads {threads}");
     drop((lookups, strings));
+    if exit_mode == "release" {
+        // Experiment: hand all free memory back to the OS before exiting.
+        // SAFETY: plain FFI calls with valid arguments.
+        unsafe {
+            mi_option_set(MI_OPTION_PURGE_DELAY, 0);
+            mi_collect(true);
+        }
+        log("memory released");
+    }
     log("end of main");
     timing::epoch("main-end");
+    if exit_mode == "_exit" {
+        // Experiment: skip atexit handlers (mimalloc's exit-time collect).
+        // SAFETY: every output file is closed and stderr is unbuffered.
+        unsafe { _exit(0) };
+    }
 }
 
 /// manifest.json: `{"window_start": "...", "window_end": "..."}`.

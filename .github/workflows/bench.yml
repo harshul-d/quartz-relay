@@ -104,6 +104,7 @@ jobs:
             || sudo apt-get install -y -qq linux-tools-generic > /dev/null 2>&1 || true
           perf=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1); [ -n "$perf" ] || perf=perf
           sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          rustup component add rust-src > /dev/null 2>&1 || true
           # HEAD built natively like the image, plus line tables (codegen unchanged).
           RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
             cargo build --release --quiet
@@ -117,8 +118,8 @@ jobs:
             $perf report -i /tmp/perf.data --stdio --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -n 45
             echo '```'
             echo; echo "### Hottest source lines per symbol"; echo; echo '```'
-            timeout 600 $perf annotate -i /tmp/perf.data --stdio -l 2>/dev/null \
-              | awk '/Percent \|/ {print; next} /^ +[0-9]+\.[0-9]+ +[^ ]+:[0-9]+/ && $1 >= 0.4 {print}' | head -n 250
+            timeout 600 $perf annotate -i /tmp/perf.data --stdio -l --full-paths 2>/dev/null \
+              | python ci/srclines.py "$(rustc --print sysroot)" 0.4 | head -n 300
             echo '```'
           } > /tmp/profile.md
           cat /tmp/profile.md >> /tmp/report.md
