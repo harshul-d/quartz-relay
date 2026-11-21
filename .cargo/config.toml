@@ -1,0 +1,3 @@
+# Local builds match the scorer image's CPU level (the Dockerfile sets its own RUSTFLAGS).
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=x86-64-v3"]

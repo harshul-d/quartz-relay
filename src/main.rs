@@ -1,8 +1,25 @@
 //! Shopping Sessions pipeline. Reads $DATA_DIR, writes $OUTPUT_DIR/user_daily/
 //! and $OUTPUT_DIR/campaign_daily/ as Parquet, exactly as rules.md defines.
+//!
+//! Data flow:
+//! 1. Lookups and links (union-find; each linked ID maps to its person's name).
+//! 2. Events, in parallel chunks: each line is parsed and validated. A valid
+//!    row goes straight to its person's partition; every row (valid or not)
+//!    also leaves an (event_id, ingest_ts, location) copy in its event_id's
+//!    partition, because dedup comes before validation.
+//! 3. Dedup per event_id partition with a hash table: every copy that loses
+//!    (a later ingest_ts, or an equal one seen second) and is valid becomes a
+//!    tombstone for its person partition.
+//! 4. Clicks, in parallel chunks: valid clicks go to their person's partition.
+//!    Copies of a click are identical, so they meet there and are dropped as
+//!    neighbours after sorting.
+//! 5. Per person partition: drop tombstoned events, sort, sessionize, credit
+//!    and assist, and aggregate.
+//! 6. Write Parquet.
 
 mod csv;
 mod key;
+mod links;
 mod out;
 mod par;
 mod ts;
@@ -11,7 +28,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use csv::{Files, for_each_line, split};
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use csv::{Files, for_each_line, for_each_record, split};
 use key::{FastMap, Interner, Key, Strings, hash};
 use ts::{DAY, HOUR, MINUTE};
 
@@ -22,46 +42,41 @@ const LOOKBACK: i64 = 7 * DAY;
 /// Records are spread over this many hash partitions (a power of two).
 const PARTITION_BITS: u32 = 8;
 const PARTITIONS: usize = 1 << PARTITION_BITS;
-const CHUNK_BYTES: usize = 4 << 20;
+const CHUNK_BYTES: u64 = 2 << 20;
 
 #[inline(always)]
 fn partition(key: Key) -> usize {
     (hash(key) >> (64 - PARTITION_BITS)) as usize
 }
 
-/// One parsed, well-formed event line with a non-empty event_id.
-#[derive(Clone, Copy)]
-struct EventRow {
-    event_id: Key,
-    user: Key,
-    ingest: i64,
-    ts: i64,
-    price: u32,
-    category: u16,
-    /// Bit 0: passes validation and is not late. Bit 1: a purchase.
-    flags: u8,
-}
-
-const VALID: u8 = 1;
-const PURCHASE: u8 = 2;
-
-/// A surviving event, keyed by its person.
+/// A surviving-so-far event in its person's partition.
 #[derive(Clone, Copy)]
 struct PersonEvent {
     person: Key,
     ts: i64,
     price: u32,
     category: u16,
-    purchase: bool,
+    flags: u8,
 }
 
-/// A valid click with a non-empty click_id.
+const PURCHASE: u8 = 1;
+const DELETED: u8 = 2;
+
+/// One copy of an event, for dedup. `location` points at the copy's
+/// `PersonEvent` (or is `INVALID` when the copy failed validation).
 #[derive(Clone, Copy)]
-struct ClickRow {
-    click_id: Key,
-    user: Key,
-    ts: i64,
-    campaign: u32,
+struct EventCopy {
+    event_id: Key,
+    ingest: i64,
+    location: u64,
+}
+
+const INVALID: u64 = u64::MAX;
+
+/// Location of a `PersonEvent`: person partition, parsing thread, index.
+#[inline(always)]
+fn location(partition: usize, thread: usize, index: usize) -> u64 {
+    partition as u64 | (thread as u64) << 16 | (index as u64) << 24
 }
 
 #[derive(Clone, Copy)]
@@ -124,22 +139,19 @@ fn main() {
     let interner = Interner::default();
     log("lookups");
 
-    let names = link_names(&data, &interner, threads);
+    let names = links::build(&data, &interner, threads, CHUNK_BYTES);
     log("links");
 
-    let event_parts = parse_events(&data, &interner, &lookups, &window, threads);
+    let events = parse_events(&data, &interner, &names, &lookups, &window, threads);
     log("events parsed");
-    let click_parts = parse_clicks(&data, &interner, &lookups, &window, threads);
+    let deletions = dedup_events(events.copies, threads);
+    log("events deduplicated");
+    let clicks = parse_clicks(&data, &interner, &names, &lookups, &window, threads);
     log("clicks parsed");
+    drop(names);
     let strings = interner.finish();
 
-    let person_events = dedup_events(event_parts, &names, threads);
-    log("events deduplicated");
-    let person_clicks = dedup_clicks(click_parts, &names, threads);
-    log("clicks deduplicated");
-    drop(names);
-
-    let results = sessionize(person_events, person_clicks, &lookups, &window, &strings, threads);
+    let results = sessionize(events.people, deletions, clicks, &lookups, &window, &strings, threads);
     log("sessionized");
 
     out::write_all(&output, results, &lookups, &window, &strings, threads);
@@ -168,16 +180,13 @@ fn read_window(path: &Path) -> Window {
 
 fn read_lookups(data: &Path) -> Lookups {
     let mut product_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-    let products = Files::open(&[data.join("products.csv")]);
-    for chunk in products.chunks(usize::MAX / 4) {
-        for_each_line(chunk.bytes(&products), |line| {
-            if let Some([product, category]) = split::<2>(line) {
-                if !product.is_empty() && !category.is_empty() {
-                    product_rows.push((product.to_vec(), category.to_vec()));
-                }
+    for_each_line(&csv::read_data_lines(&data.join("products.csv")), |line| {
+        if let Some([product, category]) = split::<2>(line) {
+            if !product.is_empty() && !category.is_empty() {
+                product_rows.push((product.to_vec(), category.to_vec()));
             }
-        });
-    }
+        }
+    });
     let mut categories: Vec<Vec<u8>> = product_rows.iter().map(|(_, c)| c.clone()).collect();
     categories.push(b"unknown".to_vec());
     categories.sort();
@@ -194,262 +203,203 @@ fn read_lookups(data: &Path) -> Lookups {
     let mut campaigns: FastMap<Vec<u8>, u32> = FastMap::default();
     let mut campaign_names = Vec::new();
     let mut channels = Vec::new();
-    let files = Files::open(&[data.join("campaigns.csv")]);
-    for chunk in files.chunks(usize::MAX / 4) {
-        for_each_line(chunk.bytes(&files), |line| {
-            if let Some([campaign, channel]) = split::<2>(line) {
-                if campaign.is_empty() || channel.is_empty() {
-                    return;
-                }
-                match campaigns.get(campaign) {
-                    Some(&index) => channels[index as usize] = channel.to_vec(),
-                    None => {
-                        campaigns.insert(campaign.to_vec(), campaign_names.len() as u32);
-                        campaign_names.push(campaign.to_vec());
-                        channels.push(channel.to_vec());
-                    }
+    for_each_line(&csv::read_data_lines(&data.join("campaigns.csv")), |line| {
+        if let Some([campaign, channel]) = split::<2>(line) {
+            if campaign.is_empty() || channel.is_empty() {
+                return;
+            }
+            match campaigns.get(campaign) {
+                Some(&index) => channels[index as usize] = channel.to_vec(),
+                None => {
+                    campaigns.insert(campaign.to_vec(), campaign_names.len() as u32);
+                    campaign_names.push(campaign.to_vec());
+                    channels.push(channel.to_vec());
                 }
             }
-        });
-    }
-    Lookups { products: products_map, categories, unknown, campaigns, campaign_names, channels }
-}
-
-/// Linked IDs: union-find over every valid link line. Returns, for each linked
-/// ID that is not its person's name, the name (the byte-wise smallest ID).
-fn link_names(data: &Path, interner: &Interner, threads: usize) -> FastMap<Key, Key> {
-    let files = Files::open_folder(&data.join("links"));
-    let chunks = files.chunks(CHUNK_BYTES);
-    let pairs = par::run(threads, chunks.len(), Vec::new, |pairs: &mut Vec<(Key, Key)>, index| {
-        for_each_line(chunks[index].bytes(&files), |line| {
-            if let Some([a, b]) = split::<2>(line) {
-                if !a.is_empty() && !b.is_empty() {
-                    pairs.push((interner.key(a), interner.key(b)));
-                }
-            }
-        });
+        }
     });
-
-    let mut ids: FastMap<Key, u32> = FastMap::default();
-    let mut keys: Vec<Key> = Vec::new();
-    let mut parent: Vec<u32> = Vec::new();
-    let intern = |key: Key, ids: &mut FastMap<Key, u32>, keys: &mut Vec<Key>, parent: &mut Vec<u32>| -> u32 {
-        *ids.entry(key).or_insert_with(|| {
-            keys.push(key);
-            parent.push(parent.len() as u32);
-            (keys.len() - 1) as u32
-        })
-    };
-    fn find(parent: &mut [u32], mut x: u32) -> u32 {
-        let mut root = x;
-        while parent[root as usize] != root {
-            root = parent[root as usize];
-        }
-        while parent[x as usize] != root {
-            let next = parent[x as usize];
-            parent[x as usize] = root;
-            x = next;
-        }
-        root
-    }
-    for list in &pairs {
-        for &(a, b) in list {
-            let a = intern(a, &mut ids, &mut keys, &mut parent);
-            let b = intern(b, &mut ids, &mut keys, &mut parent);
-            let (ra, rb) = (find(&mut parent, a), find(&mut parent, b));
-            if ra != rb {
-                parent[ra as usize] = rb;
-            }
-        }
-    }
-    drop(pairs);
-    drop(ids);
-
-    // The name of each set: its byte-wise smallest key. Long keys (interned)
-    // need their bytes; they cannot be resolved yet, so they compare through
-    // a temporary snapshot of the interner.
-    let long_bytes = |key: Key| -> Vec<u8> { interner_bytes(interner, key) };
-    let mut smallest: Vec<Key> = vec![0; keys.len()];
-    let mut has: Vec<bool> = vec![false; keys.len()];
-    for x in 0..keys.len() as u32 {
-        let root = find(&mut parent, x) as usize;
-        let key = keys[x as usize];
-        if !has[root] || compare_keys(key, smallest[root], &long_bytes).is_lt() {
-            smallest[root] = key;
-            has[root] = true;
-        }
-    }
-    let mut names: FastMap<Key, Key> = FastMap::default();
-    for x in 0..keys.len() as u32 {
-        let root = find(&mut parent, x) as usize;
-        if keys[x as usize] != smallest[root] {
-            names.insert(keys[x as usize], smallest[root]);
-        }
-    }
-    names
-}
-
-/// Byte-wise comparison of two keys while the interner is still open.
-fn compare_keys(a: Key, b: Key, long_bytes: &impl Fn(Key) -> Vec<u8>) -> std::cmp::Ordering {
-    if !key::is_long(a) && !key::is_long(b) {
-        a.cmp(&b)
-    } else {
-        long_bytes(a).cmp(&long_bytes(b))
-    }
-}
-
-fn interner_bytes(interner: &Interner, key: Key) -> Vec<u8> {
-    if key::is_long(key) {
-        interner.lookup_long(key)
-    } else {
-        let bytes = key.to_be_bytes();
-        bytes[..bytes[15] as usize].to_vec()
-    }
-}
-
-#[inline(always)]
-fn person_of(names: &FastMap<Key, Key>, user: Key) -> Key {
-    match names.get(&user) {
-        Some(&name) => name,
-        None => user,
-    }
-}
-
-type Partitioned<T> = Vec<Mutex<Vec<Vec<T>>>>;
-
-/// Regroups per-thread partition buffers into per-partition lists.
-fn transpose<T>(states: Vec<Vec<Vec<T>>>) -> Partitioned<T> {
-    let mut parts: Vec<Vec<Vec<T>>> = (0..PARTITIONS).map(|_| Vec::new()).collect();
-    for state in states {
-        for (index, buffer) in state.into_iter().enumerate() {
-            if !buffer.is_empty() {
-                parts[index].push(buffer);
-            }
-        }
-    }
-    parts.into_iter().map(Mutex::new).collect()
+    Lookups { products: products_map, categories, unknown, campaigns, campaign_names, channels }
 }
 
 fn new_partitions<T>() -> Vec<Vec<T>> {
     (0..PARTITIONS).map(|_| Vec::new()).collect()
 }
 
-/// Events 1 and 3-4 per line. Each row is kept with its validity, because
-/// dedup (step 2) happens before validation: an invalid kept copy still wins.
-fn parse_events(data: &Path, interner: &Interner, lookups: &Lookups, window: &Window, threads: usize) -> Partitioned<EventRow> {
+/// `[partition][thread]` buffers, each partition taken by one worker.
+type Partitioned<T> = Vec<Mutex<Vec<Vec<T>>>>;
+
+/// Regroups `[thread][partition]` buffers into `[partition][thread]`.
+fn transpose<T>(states: Vec<Vec<Vec<T>>>) -> Partitioned<T> {
+    let mut parts: Vec<Vec<Vec<T>>> = (0..PARTITIONS).map(|_| Vec::with_capacity(states.len())).collect();
+    for state in states {
+        for (index, buffer) in state.into_iter().enumerate() {
+            parts[index].push(buffer);
+        }
+    }
+    parts.into_iter().map(Mutex::new).collect()
+}
+
+struct ParsedEvents {
+    /// Valid rows by person partition, `[partition][thread]`.
+    people: Partitioned<PersonEvent>,
+    /// Every row's dedup copy by event_id partition.
+    copies: Partitioned<EventCopy>,
+}
+
+/// Events 1 and 3-4 per line, plus the person of each valid row.
+fn parse_events(
+    data: &Path,
+    interner: &Interner,
+    names: &links::Names,
+    lookups: &Lookups,
+    window: &Window,
+    threads: usize,
+) -> ParsedEvents {
     let files = Files::open_folder(&data.join("events"));
     let chunks = files.chunks(CHUNK_BYTES);
-    let states = par::run(threads, chunks.len(), new_partitions::<EventRow>, |parts, index| {
-        for_each_line(chunks[index].bytes(&files), |line| {
-            let Some([event_id, user, ts_text, ingest_text, event_type, product, price_text]) = split::<7>(line) else {
-                return;
-            };
-            if event_id.is_empty() {
-                return;
+    struct State {
+        thread: usize,
+        people: Vec<Vec<PersonEvent>>,
+        copies: Vec<Vec<EventCopy>>,
+    }
+    let states = par::run(
+        threads,
+        chunks.len(),
+        |thread| State { thread, people: new_partitions(), copies: new_partitions() },
+        |state, index| {
+            files.with_chunk(&chunks[index], |bytes| {
+                for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
+                    if event_id.is_empty() {
+                        return;
+                    }
+                    let event_id = interner.key(event_id);
+                    // ingest_ts is always valid F1; were it not, the copy sorts last.
+                    let ingest = ts::parse(ingest_text).unwrap_or(i64::MAX);
+                    let mut location = INVALID;
+                    'validate: {
+                        if user.is_empty() || product.is_empty() {
+                            break 'validate;
+                        }
+                        let Some(ts) = ts::parse(ts_text) else { break 'validate };
+                        if ts < window.start || ts >= window.end {
+                            break 'validate;
+                        }
+                        let purchase = match event_type {
+                            b"view" | b"cart" => false,
+                            b"purchase" => true,
+                            _ => break 'validate,
+                        };
+                        let mut price = 0;
+                        let mut category = 0;
+                        if purchase {
+                            let Some(value) = ts::price(price_text) else { break 'validate };
+                            price = value;
+                            category = lookups.products.get(product).copied().unwrap_or(lookups.unknown);
+                        }
+                        if ingest.saturating_sub(ts) > LATE_LIMIT {
+                            break 'validate;
+                        }
+                        let person = names.person(interner.key(user));
+                        let part = partition(person);
+                        let buffer = &mut state.people[part];
+                        location = location_of(part, state.thread, buffer.len());
+                        buffer.push(PersonEvent { person, ts, price, category, flags: if purchase { PURCHASE } else { 0 } });
+                    }
+                    state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location });
+                })
+            });
+        },
+    );
+    let mut people = Vec::with_capacity(states.len());
+    let mut copies = Vec::with_capacity(states.len());
+    for state in states {
+        people.push(state.people);
+        copies.push(state.copies);
+    }
+    ParsedEvents { people: transpose(people), copies: transpose(copies) }
+}
+
+#[inline(always)]
+fn location_of(partition: usize, thread: usize, index: usize) -> u64 {
+    location(partition, thread, index)
+}
+
+/// Events 2: per event_id, the copy with the smallest ingest_ts is kept (on
+/// a tie, copies are identical and the first seen is kept). Every other copy
+/// that passed validation becomes a tombstone. A kept copy that failed
+/// validation drops the event: its valid later copies are tombstoned too.
+/// Returns tombstone locations by person partition.
+fn dedup_events(copies: Partitioned<EventCopy>, threads: usize) -> Partitioned<u64> {
+    let states = par::run(threads, PARTITIONS, |_| new_partitions::<u64>(), |deletions, index| {
+        let buffers = std::mem::take(&mut *copies[index].lock().unwrap());
+        let total: usize = buffers.iter().map(Vec::len).sum();
+        if total == 0 {
+            return;
+        }
+        let capacity = (total * 2).next_power_of_two();
+        let mask = capacity - 1;
+        // Slot = 1 + index into `all` of the kept copy so far; 0 = empty.
+        let mut slots: Vec<u32> = vec![0; capacity];
+        let all: Vec<EventCopy> = buffers.concat();
+        drop(buffers);
+        let mut tombstone = |location: u64| {
+            if location != INVALID {
+                deletions[(location & 0xFFFF) as usize].push(location);
             }
-            let event_id = interner.key(event_id);
-            // ingest_ts is always valid F1; were it not, the copy sorts last.
-            let ingest = ts::parse(ingest_text).unwrap_or(i64::MAX);
-            let mut row = EventRow { event_id, user: 0, ingest, ts: 0, price: 0, category: 0, flags: 0 };
-            'validate: {
-                if user.is_empty() || product.is_empty() {
-                    break 'validate;
+        };
+        for (at, copy) in all.iter().enumerate() {
+            let mut slot = hash(copy.event_id) as usize & mask;
+            loop {
+                let held = slots[slot];
+                if held == 0 {
+                    slots[slot] = at as u32 + 1;
+                    break;
                 }
-                let Some(ts) = ts::parse(ts_text) else { break 'validate };
-                if ts < window.start || ts >= window.end {
-                    break 'validate;
+                let kept = &all[held as usize - 1];
+                if kept.event_id == copy.event_id {
+                    if copy.ingest < kept.ingest {
+                        tombstone(kept.location);
+                        slots[slot] = at as u32 + 1;
+                    } else {
+                        tombstone(copy.location);
+                    }
+                    break;
                 }
-                let purchase = match event_type {
-                    b"view" | b"cart" => false,
-                    b"purchase" => true,
-                    _ => break 'validate,
-                };
-                if purchase {
-                    let Some(price) = ts::price(price_text) else { break 'validate };
-                    row.price = price;
-                    row.category = lookups.products.get(product).copied().unwrap_or(lookups.unknown);
-                }
-                if ingest.saturating_sub(ts) > LATE_LIMIT {
-                    break 'validate;
-                }
-                row.ts = ts;
-                row.user = interner.key(user);
-                row.flags = VALID | if purchase { PURCHASE } else { 0 };
+                slot = (slot + 1) & mask;
             }
-            parts[partition(event_id)].push(row);
-        });
+        }
     });
     transpose(states)
 }
 
-/// Clicks 1 and 3 per line. Copies of a click are identical, so validating
-/// before dedup (step 2) gives the same result.
-fn parse_clicks(data: &Path, interner: &Interner, lookups: &Lookups, window: &Window, threads: usize) -> Partitioned<ClickRow> {
+/// Clicks 1 and 3 per line; valid clicks go to their person's partition.
+/// Copies of a click are identical (Clicks 2), so validating before dedup is
+/// the same, and the copies meet in one partition.
+fn parse_clicks(
+    data: &Path,
+    interner: &Interner,
+    names: &links::Names,
+    lookups: &Lookups,
+    window: &Window,
+    threads: usize,
+) -> Partitioned<PersonClick> {
     let files = Files::open_folder(&data.join("clicks"));
     let chunks = files.chunks(CHUNK_BYTES);
-    let states = par::run(threads, chunks.len(), new_partitions::<ClickRow>, |parts, index| {
-        for_each_line(chunks[index].bytes(&files), |line| {
-            let Some([click_id, user, campaign, ts_text]) = split::<4>(line) else { return };
-            if click_id.is_empty() || user.is_empty() {
-                return;
-            }
-            let Some(ts) = ts::parse(ts_text) else { return };
-            if ts < window.click_start || ts >= window.end {
-                return;
-            }
-            let Some(&campaign) = lookups.campaigns.get(campaign) else { return };
-            let click_id = interner.key(click_id);
-            parts[partition(click_id)].push(ClickRow { click_id, user: interner.key(user), ts, campaign });
+    let states = par::run(threads, chunks.len(), |_| new_partitions::<PersonClick>(), |parts, index| {
+        files.with_chunk(&chunks[index], |bytes| {
+            for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
+                if click_id.is_empty() || user.is_empty() {
+                    return;
+                }
+                let Some(ts) = ts::parse(ts_text) else { return };
+                if ts < window.click_start || ts >= window.end {
+                    return;
+                }
+                let Some(&campaign) = lookups.campaigns.get(campaign) else { return };
+                let person = names.person(interner.key(user));
+                parts[partition(person)].push(PersonClick { person, click_id: interner.key(click_id), ts, campaign });
+            })
         });
-    });
-    transpose(states)
-}
-
-/// Events 2: per event_id keep the copy with the smallest ingest_ts; keep it
-/// only if valid. Survivors are regrouped by person.
-fn dedup_events(parts: Partitioned<EventRow>, names: &FastMap<Key, Key>, threads: usize) -> Partitioned<PersonEvent> {
-    let states = par::run(threads, PARTITIONS, new_partitions::<PersonEvent>, |out, index| {
-        let buffers = std::mem::take(&mut *parts[index].lock().unwrap());
-        let mut rows: Vec<EventRow> = buffers.concat();
-        drop(buffers);
-        rows.sort_unstable_by_key(|row| (row.event_id, row.ingest));
-        let mut previous: Option<Key> = None;
-        for row in &rows {
-            if previous == Some(row.event_id) {
-                continue;
-            }
-            previous = Some(row.event_id);
-            if row.flags & VALID != 0 {
-                let person = person_of(names, row.user);
-                out[partition(person)].push(PersonEvent {
-                    person,
-                    ts: row.ts,
-                    price: row.price,
-                    category: row.category,
-                    purchase: row.flags & PURCHASE != 0,
-                });
-            }
-        }
-    });
-    transpose(states)
-}
-
-/// Clicks 2: keep one copy per click_id, regrouped by person.
-fn dedup_clicks(parts: Partitioned<ClickRow>, names: &FastMap<Key, Key>, threads: usize) -> Partitioned<PersonClick> {
-    let states = par::run(threads, PARTITIONS, new_partitions::<PersonClick>, |out, index| {
-        let buffers = std::mem::take(&mut *parts[index].lock().unwrap());
-        let mut rows: Vec<ClickRow> = buffers.concat();
-        drop(buffers);
-        rows.sort_unstable_by_key(|row| row.click_id);
-        let mut previous: Option<Key> = None;
-        for row in &rows {
-            if previous == Some(row.click_id) {
-                continue;
-            }
-            previous = Some(row.click_id);
-            let person = person_of(names, row.user);
-            out[partition(person)].push(PersonClick { person, click_id: row.click_id, ts: row.ts, campaign: row.campaign });
-        }
     });
     transpose(states)
 }
@@ -471,7 +421,8 @@ struct Session {
 
 /// Events 5-7 and Clicks 4-7, one person at a time.
 fn sessionize(
-    events: Partitioned<PersonEvent>,
+    people: Partitioned<PersonEvent>,
+    deletions: Partitioned<u64>,
     clicks: Partitioned<PersonClick>,
     lookups: &Lookups,
     window: &Window,
@@ -484,9 +435,21 @@ fn sessionize(
     par::run(
         threads,
         PARTITIONS,
-        || ThreadResult { user_days: Vec::new(), campaigns: vec![[0; 4]; (organic + 1) * days] },
+        |_| ThreadResult { user_days: Vec::new(), campaigns: vec![[0; 4]; (organic + 1) * days] },
         |result, index| {
-            let mut events: Vec<PersonEvent> = std::mem::take(&mut *events[index].lock().unwrap()).concat();
+            let mut buffers = std::mem::take(&mut *people[index].lock().unwrap());
+            for list in std::mem::take(&mut *deletions[index].lock().unwrap()) {
+                for location in list {
+                    let thread = ((location >> 16) & 0xFF) as usize;
+                    buffers[thread][(location >> 24) as usize].flags |= DELETED;
+                }
+            }
+            let total: usize = buffers.iter().map(Vec::len).sum();
+            let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
+            for buffer in &buffers {
+                events.extend(buffer.iter().filter(|event| event.flags & DELETED == 0));
+            }
+            drop(buffers);
             let mut clicks: Vec<PersonClick> = std::mem::take(&mut *clicks[index].lock().unwrap()).concat();
             if events.is_empty() {
                 return;
@@ -495,6 +458,8 @@ fn sessionize(
             clicks.sort_unstable_by(|a, b| {
                 a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| strings.cmp(a.click_id, b.click_id))
             });
+            // Clicks 2: identical copies are now neighbours.
+            clicks.dedup_by(|b, a| a.person == b.person && a.click_id == b.click_id);
 
             let mut sessions: Vec<Session> = Vec::new();
             let mut category_sums: Vec<u64> = vec![0; categories];
@@ -534,7 +499,7 @@ fn sessionize(
                     previous = event.ts;
                     let session = sessions.last_mut().unwrap();
                     session.events += 1;
-                    if event.purchase {
+                    if event.flags & PURCHASE != 0 {
                         session.revenue += event.price as u64;
                         session.purchase = true;
                     }
@@ -558,18 +523,21 @@ fn sessionize(
                         row.sessions += 1;
                         row.events += session.events;
                         row.revenue += session.revenue;
-                        for event in &events[event_at..event_at + session.events as usize] {
-                            if event.purchase {
-                                let category = event.category as usize;
-                                if category_sums[category] == 0 {
-                                    touched.push(event.category);
+                        if session.purchase {
+                            for event in &events[event_at..event_at + session.events as usize] {
+                                if event.flags & PURCHASE != 0 {
+                                    let category = event.category as usize;
+                                    if category_sums[category] == 0 {
+                                        touched.push(event.category);
+                                    }
+                                    category_sums[category] += event.price as u64;
                                 }
-                                category_sums[category] += event.price as u64;
                             }
                         }
                         event_at += session.events as usize;
                         session_at += 1;
                     }
+                    // Events 7 / top_category: highest sum, ties to the smallest name.
                     let mut best: u64 = 0;
                     for &category in &touched {
                         let sum = category_sums[category as usize];

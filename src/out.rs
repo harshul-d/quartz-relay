@@ -131,7 +131,7 @@ pub fn write_all(output: &Path, results: Vec<ThreadResult>, lookups: &Lookups, w
 
     let user_rows: Vec<Vec<UserDay>> = results.into_iter().map(|result| result.user_days).collect();
     let jobs = user_rows.len().max(1);
-    par::run(threads, jobs + 1, || (), |_, job| {
+    par::run(threads, jobs + 1, |_| (), |_, job| {
         if job < jobs {
             let rows: &[UserDay] = user_rows.get(job).map_or(&[], |rows| rows.as_slice());
             if rows.is_empty() && job != 0 {
