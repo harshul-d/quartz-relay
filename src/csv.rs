@@ -326,7 +326,9 @@ impl Files {
             if buffer.len() < length {
                 buffer.resize(length, 0);
             }
+            let begin = std::time::Instant::now();
             let read = read_at(&self.files[chunk.file], &mut buffer[..length], chunk.start);
+            crate::timing::READ.add_since(begin);
             f(&buffer[..read])
         })
     }

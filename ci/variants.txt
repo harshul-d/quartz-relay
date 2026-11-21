@@ -1,0 +1,4 @@
+# name  git-ref  [KEY=VALUE ...]  (extra container environment for flag-gated experiments)
+# The first line is the baseline the others are checked against.
+v8    v8
+head  HEAD

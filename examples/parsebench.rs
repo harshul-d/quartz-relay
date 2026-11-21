@@ -10,6 +10,9 @@ mod key;
 mod links;
 #[path = "../src/par.rs"]
 mod par;
+#[path = "../src/timing.rs"]
+#[allow(dead_code)]
+mod timing;
 #[path = "../src/ts.rs"]
 #[allow(dead_code)]
 mod ts;

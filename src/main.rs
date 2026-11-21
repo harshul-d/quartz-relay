@@ -22,6 +22,7 @@ mod key;
 mod links;
 mod out;
 mod par;
+mod timing;
 mod ts;
 
 use std::path::{Path, PathBuf};
@@ -167,6 +168,10 @@ fn main() {
 
     out::write_all(&output, results, &lookups, &window, &strings, threads);
     log("written");
+    timing::report();
+    eprintln!("threads {threads}");
+    drop((lookups, strings));
+    log("end of main");
 }
 
 /// manifest.json: `{"window_start": "...", "window_end": "..."}`.
@@ -558,6 +563,7 @@ fn sessionize(
         |_| ThreadResult { user_days: Vec::new(), campaigns: vec![[0; 4]; (organic + 1) * days] },
         |result, item| {
             let index = order[item];
+            let begin = Instant::now();
             let mut buffers = std::mem::take(&mut *people[index].lock().unwrap());
             for list in std::mem::take(&mut *deletions[index].lock().unwrap()) {
                 for location in list {
@@ -586,6 +592,7 @@ fn sessionize(
             }
             let persons = ids.keys();
             if persons.is_empty() {
+                timing::GROUP_EVENTS.add_since(begin);
                 return;
             }
             let sum = prefix_sums(&mut event_starts);
@@ -609,6 +616,8 @@ fn sessionize(
             for person in 0..persons.len() {
                 events[event_starts[person]..event_starts[person + 1]].sort_unstable_by_key(|event| event.ts);
             }
+            timing::GROUP_EVENTS.add_since(begin);
+            let begin = Instant::now();
 
             // The same grouping for clicks; clicks of people without events can
             // credit nothing and are dropped.
@@ -653,6 +662,10 @@ fn sessionize(
                 }
                 click_ends[person] = start + kept;
             }
+            timing::GROUP_CLICKS.add_since(begin);
+            let begin = Instant::now();
+            let loop_start = timing::ticks();
+            let mut attribution_ticks = 0u64;
 
             let mut sessions: Vec<Session> = Vec::new();
             let mut category_sums: Vec<u64> = vec![0; categories];
@@ -730,8 +743,20 @@ fn sessionize(
                     result.user_days.push(row);
                 }
 
+                let attribution_start = timing::ticks();
                 attribute(&sessions, person_clicks, organic, days, &mut result.campaigns, &mut scratch);
+                attribution_ticks += timing::ticks().wrapping_sub(attribution_start);
             }
+            // Split the measured span by the cycle-count share of attribution.
+            let nanos = begin.elapsed().as_nanos() as u64;
+            let loop_ticks = timing::ticks().wrapping_sub(loop_start);
+            let attribution = if loop_ticks == 0 {
+                0
+            } else {
+                (nanos as f64 * (attribution_ticks as f64 / loop_ticks as f64).min(1.0)) as u64
+            };
+            timing::ATTRIBUTION.add_nanos(attribution);
+            timing::SESSIONS.add_nanos(nanos - attribution);
         },
     )
 }

@@ -1,0 +1,122 @@
+name: bench
+
+on:
+  push:
+    branches: [perf]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bench
+  cancel-in-progress: false
+
+env:
+  SEED: "101"
+  EVENTS: "20000000"
+  CLICKS: "5000000"
+  DATA: /home/runner/bench-data
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Machine
+        run: |
+          lscpu
+          nproc
+          free -g
+          df -h /home/runner
+          for f in avx avx2 bmi1 bmi2 f16c fma abm movbe xsave avx512f avx512bw avx512vl; do
+            if grep -qw "$f" /proc/cpuinfo; then echo "flag $f: yes"; else echo "flag $f: NO"; fi
+          done
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+          docker version --format '{{.Server.Version}}'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python packages
+        run: pip install --quiet polars pyarrow
+
+      - name: Restore datasets
+        id: data
+        uses: actions/cache/restore@v4
+        with:
+          path: /home/runner/bench-data
+          key: data-${{ hashFiles('tools/gen/**') }}-s${{ env.SEED }}-e${{ env.EVENTS }}-c${{ env.CLICKS }}
+
+      - name: Generate datasets
+        if: steps.data.outputs.cache-hit != 'true'
+        run: |
+          cargo build --release --manifest-path tools/gen/Cargo.toml
+          gen=tools/gen/target/release/generate
+          rm -rf "$DATA"; mkdir -p "$DATA"
+          time $gen --seed 1 --events 1000000 --clicks 250000 --output "$DATA/dev"
+          time $gen --seed "$SEED" --events "$EVENTS" --clicks "$CLICKS" --output "$DATA/big"
+          du -sh "$DATA"/*
+
+      - name: Save datasets
+        if: steps.data.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/bench-data
+          key: ${{ steps.data.outputs.cache-primary-key }}
+
+      - name: Build image
+        run: |
+          if grep -qw avx2 /proc/cpuinfo && grep -qw bmi2 /proc/cpuinfo && grep -qw fma /proc/cpuinfo && grep -qw movbe /proc/cpuinfo; then
+            docker build -t pipeline:latest .
+          else
+            echo "::warning::runner lacks x86-64-v3; the CI image is built for x86-64-v2"
+            sed 's/target-cpu=x86-64-v3/target-cpu=x86-64-v2/' Dockerfile > /tmp/Dockerfile.ci
+            docker build -t pipeline:latest -f /tmp/Dockerfile.ci .
+          fi
+
+      - name: Fixtures (Docker)
+        run: CPUS=$(nproc) python scripts/run_fixtures.py fixtures -- sh scripts/docker_run.sh
+
+      - name: Dev answer (Docker)
+        run: |
+          out=$(mktemp -d)
+          CPUS=$(nproc) sh scripts/docker_run.sh "$DATA/dev" "$out/dev"
+          python scripts/compare.py "$out/dev" ci/dev-answer | tee /tmp/dev-check.txt
+          tail -n 1 /tmp/dev-check.txt | grep -qx MATCH
+          echo "::notice title=dev answer::$(tail -n 1 /tmp/dev-check.txt)"
+
+      - name: Benchmark
+        run: |
+          python ci/bench.py --data "$DATA/big" --variants ci/variants.txt --work /home/runner/bench-work \
+            --report /tmp/report.md --reps 5
+          cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Publish results
+        if: always()
+        run: |
+          [ -f /tmp/report.md ] || echo "# Benchmark ${GITHUB_SHA} failed: see run ${GITHUB_RUN_ID}" > /tmp/report.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          wt=/home/runner/results-tree
+          rm -rf "$wt"
+          if git fetch -q origin bench; then
+            git worktree add -q -B bench "$wt" FETCH_HEAD
+          else
+            git worktree add -q --detach "$wt"
+            git -C "$wt" checkout -q --orphan bench
+            git -C "$wt" rm -rfq .
+          fi
+          mkdir -p "$wt/results"
+          cp /tmp/report.md "$wt/results/${GITHUB_SHA}.md"
+          git -C "$wt" add results
+          git -C "$wt" commit -q -m "Add benchmark results for ${GITHUB_SHA::7}"
+          for attempt in 1 2 3 4 5; do
+            git -C "$wt" push -q origin HEAD:bench && break
+            git -C "$wt" pull -q --rebase origin bench
+          done
