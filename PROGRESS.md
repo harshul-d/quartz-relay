@@ -1,4 +1,4 @@
-READY TO SUBMIT: v3 cd0ce1e9eb045ec0f499090a2da63513b0e7381e (local 20M: about 4.5-4.9 s under heavy outside CPU load; v1 7.5 s under the same load; 60M about 26 s, disk-bound on this laptop)
+READY TO SUBMIT: v4 7d88f40ac9285726075b04d077256f9c777ea04d (local 20M: ~15% faster than v3 in A/B under heavy outside CPU load; absolute times on this shared laptop are not meaningful, see Timings)
 
 # Progress
 
@@ -43,6 +43,8 @@ READY TO SUBMIT: v3 cd0ce1e9eb045ec0f499090a2da63513b0e7381e (local 20M: about 4
 ### Phase 3: speed (in progress)
 - Finding: on Windows, first-touch page faults of memory-mapped input cost ~2.5 s for 1.6 GB (scan itself 0.08 s); positional reads into a reused per-thread buffer take ~0.6 s. Linux faults are far cheaper, but pread is predictable on both and was adopted.
 - Finding: link maps grew by rehashing (0.5 s); replaced by a partitioned open-addressing table built in parallel, plus a bitset filter in front of the person lookup.
+- v4: timestamp fast path (all digits checked at once, month-start table, 8-digit SWAR for F3) checked against the plain parser on 400k random inputs; partition buffers pre-sized from input bytes (no regrowth copies). A/B vs v3, 5 interleaved rounds: median wall 7.22 s vs 8.48 s, CPU 23.0 s vs 26.7 s (machine heavily loaded).
+- Single-thread profile (20M, NCPU=1): events parse ~13 s of which ~5 s is Windows read/kernel time; tokenizer ~63 ns/row (1.2 GB/s), two timestamps ~50 ns/row, two scattered pushes ~95 ns/row into fresh memory vs ~35 ns reused. Sessionize: grouping ~1.9 s, person loop ~1.2 s (attribution 0.8 s).
 - v3: hand-written Parquet writer (drops the parquet crate; Docker build much lighter). `scripts/check_parquet.py` reads output with pyarrow and DuckDB and checks schema (String, Date logical types), multi-row-group files (tested with 1,000-row groups) and empty outputs; all agree with polars.
 - v3: 60M run peak private memory 7.1 GiB.
 - v2: fixtures 36/36, dev MATCH, differential 13/13 MATCH, unit tests incl. 25k-round tokenizer fuzz against the plain splitter (it caught an unterminated last line ending in an empty field).
@@ -54,6 +56,7 @@ READY TO SUBMIT: v3 cd0ce1e9eb045ec0f499090a2da63513b0e7381e (local 20M: about 4
 | v2 | 4.5 s* | - | pread into reused buffers, AVX2 tokenizer, hash dedup with tombstones, partitioned link table, mimalloc |
 
 | v3 | ~4.7 s* | ~26 s | counting-sort grouping by dense person id, hand-written Parquet writer, packed-key lookups |
+| v4 | v3 -15% (A/B) | - | SWAR/table timestamp parser, pre-sized partition buffers |
 
 \* From v2 on, another user's 8-process Python job shares this laptop's CPU, so absolute times are inflated and noisy; versions are compared A/B interleaved under the same load (v1 measured 7.3-7.7 s alongside v2).
 
