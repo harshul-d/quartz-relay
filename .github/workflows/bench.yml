@@ -22,6 +22,11 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # Identical shards: each lands on whatever hardware the pool gives it.
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,6 +70,7 @@ jobs:
 
       - name: Save datasets
         if: steps.data.outputs.cache-hit != 'true'
+        continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: /home/runner/bench-data
@@ -97,7 +103,8 @@ jobs:
             --report /tmp/report.md --reps 5
           cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Profile (first variant, native, warm)
+      - name: Profile (HEAD, native, warm)
+        if: matrix.shard == 1
         continue-on-error: true
         run: |
           sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 \
@@ -141,10 +148,10 @@ jobs:
             git -C "$wt" rm -rfq .
           fi
           mkdir -p "$wt/results"
-          cp /tmp/report.md "$wt/results/${GITHUB_SHA}.md"
+          cp /tmp/report.md "$wt/results/${GITHUB_SHA}-${{ matrix.shard }}.md"
           git -C "$wt" add results
-          git -C "$wt" commit -q -m "Add benchmark results for ${GITHUB_SHA::7}"
-          for attempt in 1 2 3 4 5; do
+          git -C "$wt" commit -q -m "Add benchmark results for ${GITHUB_SHA::7} shard ${{ matrix.shard }}"
+          for attempt in 1 2 3 4 5 6 7 8; do
             git -C "$wt" push -q origin HEAD:bench && break
             git -C "$wt" pull -q --rebase origin bench
           done

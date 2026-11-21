@@ -151,6 +151,19 @@ fn main() {
         std::hint::black_box(&block);
         eprintln!("{:>8.3}s probe touched {megabytes} MB", begin.elapsed().as_secs_f64());
         std::mem::forget(block);
+        if std::env::var_os("PIPELINE_PROBE_READ").is_some_and(|v| v == "1") {
+            // ... and read every input file the way the pipeline does.
+            let mut bytes = 0u64;
+            for table in ["links", "events", "clicks"] {
+                let files = csv::Files::open_folder(&data.join(table));
+                let chunks = files.chunks(CHUNK_BYTES);
+                let sums = par::run(4, chunks.len(), |_| 0u64, |sum, index| {
+                    *sum += files.with_chunk(&chunks[index], |b| b.len() as u64);
+                });
+                bytes += sums.iter().sum::<u64>();
+            }
+            eprintln!("{:>8.3}s probe read {bytes} bytes", begin.elapsed().as_secs_f64());
+        }
         if let Some(written) = std::env::var("PIPELINE_PROBE_WRITE_MB").ok().and_then(|v| v.parse::<usize>().ok()) {
             // ... and write this much to an output file (fsynced if PIPELINE_FSYNC=1).
             let bytes: Vec<u8> = (0..written << 20).map(|i| (i * 7 + i / 4093) as u8).collect();
