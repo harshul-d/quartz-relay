@@ -303,6 +303,7 @@ fn parse_events(
     window: &Window,
     threads: usize,
 ) -> ParsedEvents {
+    let skip: u8 = std::env::var("PIPELINE_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     let files = Files::open_folder(&data.join("events"));
     let chunks = files.chunks(CHUNK_BYTES);
     // Event lines average ~75 bytes; reserve for a little more rows than that,
@@ -329,8 +330,16 @@ fn parse_events(
         copies: Vec<Vec<EventCopy>>,
         pending: Vec<Pending>,
         dates: ts::Parser,
+        /// Diagnostics only (`PIPELINE_SKIP`, wrong output): bit 0 skips the
+        /// dedup copies, bit 1 the person records, bit 2 the whole lookup and
+        /// scatter, bit 3 everything after tokenizing.
+        skip: u8,
     }
     fn flush(state: &mut State, names: &links::Names) {
+        if state.skip & 4 != 0 {
+            state.pending.clear();
+            return;
+        }
         for row in state.pending.iter_mut() {
             row.linked = names.may_be_linked(row.hashed);
             if row.linked {
@@ -347,8 +356,12 @@ fn parse_events(
             };
             let buffer = &mut state.people[part];
             let location = location_of(part, state.thread, buffer.len());
-            buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
-            state.copies[partition(row.event_id)].push(EventCopy { event_id: row.event_id, ingest: row.ingest, location });
+            if state.skip & 2 == 0 {
+                buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
+            }
+            if state.skip & 1 == 0 {
+                state.copies[partition(row.event_id)].push(EventCopy { event_id: row.event_id, ingest: row.ingest, location });
+            }
         }
         state.pending.clear();
     }
@@ -361,11 +374,12 @@ fn parse_events(
             copies: sized_partitions(capacity),
             pending: Vec::with_capacity(BATCH),
             dates: ts::Parser::default(),
+            skip,
         },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
                 for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
-                    if event_id.is_empty() {
+                    if event_id.is_empty() || state.skip & 8 != 0 {
                         return;
                     }
                     let event_id = interner.key_in(bytes, event_id);
@@ -414,7 +428,9 @@ fn parse_events(
                         return;
                     }
                     // Failed validation: only the dedup copy is kept.
-                    state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                    if state.skip & 1 == 0 {
+                        state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                    }
                 });
                 flush(state, names);
             });
