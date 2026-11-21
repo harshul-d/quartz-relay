@@ -275,6 +275,11 @@ impl Files {
         Files { files, lengths }
     }
 
+    /// Total size of all the files, in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.lengths.iter().sum()
+    }
+
     /// The offset just past the first `\n` at or after `from`, or the file
     /// length if there is none.
     fn next_line_start(&self, file: usize, from: u64) -> u64 {

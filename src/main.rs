@@ -225,6 +225,15 @@ fn new_partitions<T>() -> Vec<Vec<T>> {
     (0..PARTITIONS).map(|_| Vec::new()).collect()
 }
 
+/// Per-thread, per-partition capacity for about `rows` rows in total.
+fn partition_capacity(rows: u64, threads: usize) -> usize {
+    (rows as usize / threads.max(1) / PARTITIONS) + 16
+}
+
+fn sized_partitions<T>(capacity: usize) -> Vec<Vec<T>> {
+    (0..PARTITIONS).map(|_| Vec::with_capacity(capacity)).collect()
+}
+
 /// `[partition][thread]` buffers, each partition taken by one worker.
 type Partitioned<T> = Vec<Mutex<Vec<Vec<T>>>>;
 
@@ -257,6 +266,9 @@ fn parse_events(
 ) -> ParsedEvents {
     let files = Files::open_folder(&data.join("events"));
     let chunks = files.chunks(CHUNK_BYTES);
+    // Event lines average ~75 bytes; reserve for a little more rows than that,
+    // so the partition buffers almost never grow (and copy).
+    let capacity = partition_capacity(files.total_bytes() / 64, threads);
     struct State {
         thread: usize,
         people: Vec<Vec<PersonEvent>>,
@@ -265,7 +277,7 @@ fn parse_events(
     let states = par::run(
         threads,
         chunks.len(),
-        |thread| State { thread, people: new_partitions(), copies: new_partitions() },
+        |thread| State { thread, people: sized_partitions(capacity), copies: sized_partitions(capacity) },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
                 for_each_record::<7>(bytes, |&[event_id, user, ts_text, ingest_text, event_type, product, price_text]| {
@@ -385,7 +397,9 @@ fn parse_clicks(
 ) -> Partitioned<PersonClick> {
     let files = Files::open_folder(&data.join("clicks"));
     let chunks = files.chunks(CHUNK_BYTES);
-    let states = par::run(threads, chunks.len(), |_| new_partitions::<PersonClick>(), |parts, index| {
+    // Click lines average ~45 bytes.
+    let capacity = partition_capacity(files.total_bytes() / 38, threads);
+    let states = par::run(threads, chunks.len(), |_| sized_partitions::<PersonClick>(capacity), |parts, index| {
         files.with_chunk(&chunks[index], |bytes| {
             for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
                 if click_id.is_empty() || user.is_empty() {
