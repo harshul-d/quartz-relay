@@ -2,7 +2,7 @@
 # differential suite. Usage: powershell -File scripts/verify.ps1
 $root = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 $work = Split-Path -Parent $root
-$bin = Join-Path $root "target\release\shopping-sessions.exe"
+$bin = Join-Path $root "target\release\pipeline.exe"
 Set-Location $root
 cargo build --release 2>&1 | Select-Object -Last 1
 cargo test --release 2>&1 | Select-String "test result|FAILED"

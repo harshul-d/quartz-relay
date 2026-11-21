@@ -1,10 +1,9 @@
-# Shopping Sessions (Rust)
+# Click-stream sessionization pipeline (Rust)
 
-A solo entry for the Databricks "Shopping Sessions" track of the Builders Buildathon.
 The pipeline reads the raw clickstream in `$DATA_DIR` (events, clicks, ID links,
 products, campaigns and a manifest) and writes two Parquet tables,
-`$OUTPUT_DIR/user_daily/` and `$OUTPUT_DIR/campaign_daily/`, exactly as the track's
-`rules.md` defines: CSV dialect quirks, linked IDs, event dedup, validation, late
+`$OUTPUT_DIR/user_daily/` and `$OUTPUT_DIR/campaign_daily/`, exactly as the
+specification (`rules.md`) defines: CSV dialect quirks, linked IDs, event dedup, validation, late
 events, 30-minute sessions, last-click attribution and 7-day assists.
 
 It is one native Rust binary that uses every core:
@@ -36,13 +35,13 @@ It is one native Rust binary that uses every core:
 
 ```sh
 cargo build --release                      # local build
-docker buildx build --platform linux/amd64 --load -t shopping-sessions:latest .
+docker buildx build --platform linux/amd64 --load -t pipeline:latest .
 ```
 
 ## Run
 
 ```sh
-DATA_DIR=/path/to/data OUTPUT_DIR=/path/to/out target/release/shopping-sessions
+DATA_DIR=/path/to/data OUTPUT_DIR=/path/to/out target/release/pipeline
 scripts/docker_run.sh /path/to/data /path/to/out    # the image, with the scorer's flags
 ```
 
@@ -53,10 +52,10 @@ scripts/docker_run.sh /path/to/data /path/to/out    # the image, with the scorer
 Needs Python 3.10+ with `polars` and `pyarrow`.
 
 ```sh
-python scripts/run_fixtures.py fixtures -- target/release/shopping-sessions      # 36 fixtures
+python scripts/run_fixtures.py fixtures -- target/release/pipeline      # 36 fixtures
 python scripts/run_fixtures.py fixtures -- python reference/reference.py        # same, for the reference
 python scripts/compare.py OUT dev-answer                                        # dev set vs published answer
-python scripts/diff_test.py --generator generate --binary target/release/shopping-sessions --data ../data/diff
+python scripts/diff_test.py --generator generate --binary target/release/pipeline --data ../data/diff
 ```
 
 ## Open-source libraries

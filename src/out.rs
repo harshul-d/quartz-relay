@@ -277,7 +277,7 @@ impl Writer {
             meta.i64(3, *rows as i64);
             meta.end();
         }
-        meta.string(6, b"shopping-sessions");
+        meta.string(6, b"pipeline");
         meta.out.push(0);
 
         self.file.extend_from_slice(&meta.out);

@@ -1,4 +1,4 @@
-//! Shopping Sessions pipeline. Reads $DATA_DIR, writes $OUTPUT_DIR/user_daily/
+//! Click-stream sessionization pipeline. Reads $DATA_DIR, writes $OUTPUT_DIR/user_daily/
 //! and $OUTPUT_DIR/campaign_daily/ as Parquet, exactly as rules.md defines.
 //!
 //! Data flow:

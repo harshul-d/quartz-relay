@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Shopping Sessions: slow, plain reference implementation (the oracle).
+Click-stream sessionization: slow, plain reference implementation (the oracle).
 
 It follows rules.md line by line and favours clarity over speed. The Rust
 pipeline is tested against it.

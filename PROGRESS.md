@@ -5,7 +5,7 @@ READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: 5.4 s o
 ## Environment (Windows 11 laptop: i5-1135G7, 4 cores / 8 threads, AVX-512, 16 GB RAM)
 - No WSL distribution installed, no Docker, no GitHub CLI. Per instructions none of these were installed.
   - The Docker image cannot be built or run locally; the Dockerfile is reviewed by hand against the scorer environment (below).
-  - The repo is committed locally only. **It still needs a public GitHub repo (buildathon-shopping-sessions) and a push, including tags** (`git push -u origin main --tags`).
+  - The repo is committed locally only. **It still needs a public GitHub repo (quartz-relay) and a push, including tags** (`git push -u origin main --tags`).
 - Rust: rustup via winget (stable 1.100, x86_64-pc-windows-msvc). Visual Studio Build Tools 2026 were already present, so the MSVC linker works. The `x86_64-unknown-linux-gnu` std is installed: with mimalloc temporarily removed, `cargo check --target x86_64-unknown-linux-gnu` with the Dockerfile's RUSTFLAGS type-checks all of our Linux code paths (mimalloc's C part needs the image's gcc).
 - Python 3.14.3 with pyarrow, polars, duckdb and psutil (pip --user).
 - git 2.51 with global core.autocrlf=true; `.gitattributes` (`* -text`) overrides it for this repo.
@@ -14,6 +14,15 @@ READY TO SUBMIT: v7 de79cc3f8b28063805c318615267fece3a937d12 (local 20M: 5.4 s o
   - `s101-20m/` seed 101, 20M events, 5M clicks; `s102-60m/` seed 102, 60M events, 15M clicks;
   - `bins/` saved binaries of earlier versions for A/B timing.
 - Generator built from `../generator` (stale Cargo.lock deleted): `../generator/target/release/generate.exe`.
+
+## Public clean-up (v8)
+- The public repo will be named quartz-relay. Every tracked file name and content was cleared of the event, sponsor and track names listed in the clean-up request (checked case-insensitively, allowing spaces, hyphens and underscores between word parts, with `git grep -iE` over all tracked files: no hits). They are deliberately not spelled out here.
+- Neutral names: package and binary `pipeline`, Docker image tag `pipeline:latest` (README, `scripts/docker_run.sh`), title "Click-stream sessionization pipeline". The Parquet writer's `created_by` metadata string is now `pipeline` (file metadata only; table contents are unchanged).
+- `Cargo.lock` changed only by the package entry moving to its alphabetical place; no dependency versions changed.
+- No commit message contained any of the words, so history was not rewritten and tags v1-v7 still point at their original commits. Note: the file contents of the older commits (v1-v7) still contain the words; they become public if the history or those tags are pushed.
+- After the rename: unit tests 6/6, fixtures 36/36, dev answer MATCH, full differential suite (15 datasets) MATCH, pyarrow/DuckDB Parquet check OK.
+- `../versions/v1` to `../versions/v8` (outside the repo) hold `git archive` snapshots of the tracked files at each tag.
+- No git remote added; nothing pushed.
 
 ## Local machine notes
 - 2026-11-21: another user's Python batch job (8-18 processes) saturated all CPUs for hours; later the laptop ran on battery (Balanced plan, throttled) with the search indexer busy. All speed decisions were made from interleaved A/B runs under the same conditions; absolute times vary 2x between sessions.
