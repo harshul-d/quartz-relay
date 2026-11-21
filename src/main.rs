@@ -50,7 +50,7 @@ fn partition(key: Key) -> usize {
 }
 
 /// A surviving-so-far event in its person's partition.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PersonEvent {
     person: Key,
     ts: i64,
@@ -79,7 +79,7 @@ fn location(partition: usize, thread: usize, index: usize) -> u64 {
     partition as u64 | (thread as u64) << 16 | (index as u64) << 24
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PersonClick {
     person: Key,
     click_id: Key,
@@ -444,45 +444,108 @@ fn sessionize(
                     buffers[thread][(location >> 24) as usize].flags |= DELETED;
                 }
             }
+            // Group by person without a big sort: a dense id per person in this
+            // partition, a counting sort by id, then a small sort by ts per person.
             let total: usize = buffers.iter().map(Vec::len).sum();
-            let mut events: Vec<PersonEvent> = Vec::with_capacity(total);
+            let mut ids: FastMap<Key, u32> = FastMap::with_capacity_and_hasher(total / 16 + 16, Default::default());
+            let mut persons: Vec<Key> = Vec::new();
+            let mut event_starts: Vec<usize> = Vec::new(); // counts, then offsets
+            let mut event_ids: Vec<u32> = Vec::with_capacity(total);
             for buffer in &buffers {
-                events.extend(buffer.iter().filter(|event| event.flags & DELETED == 0));
+                for event in buffer {
+                    if event.flags & DELETED != 0 {
+                        continue;
+                    }
+                    let id = *ids.entry(event.person).or_insert_with(|| {
+                        persons.push(event.person);
+                        event_starts.push(0);
+                        (persons.len() - 1) as u32
+                    });
+                    event_starts[id as usize] += 1;
+                    event_ids.push(id);
+                }
             }
-            drop(buffers);
-            let mut clicks: Vec<PersonClick> = std::mem::take(&mut *clicks[index].lock().unwrap()).concat();
-            if events.is_empty() {
+            if persons.is_empty() {
                 return;
             }
-            events.sort_unstable_by_key(|event| (event.person, event.ts));
-            clicks.sort_unstable_by(|a, b| {
-                a.person.cmp(&b.person).then(a.ts.cmp(&b.ts)).then_with(|| strings.cmp(a.click_id, b.click_id))
-            });
-            // Clicks 2: identical copies are now neighbours.
-            clicks.dedup_by(|b, a| a.person == b.person && a.click_id == b.click_id);
+            let mut sum = 0;
+            for start in event_starts.iter_mut() {
+                let count = *start;
+                *start = sum;
+                sum += count;
+            }
+            event_starts.push(sum);
+            let mut events: Vec<PersonEvent> = vec![PersonEvent::default(); sum];
+            let mut cursor: Vec<usize> = event_starts[..persons.len()].to_vec();
+            let mut live = event_ids.iter();
+            for buffer in &buffers {
+                for event in buffer {
+                    if event.flags & DELETED == 0 {
+                        let id = *live.next().unwrap() as usize;
+                        events[cursor[id]] = *event;
+                        cursor[id] += 1;
+                    }
+                }
+            }
+            drop(buffers);
+            drop(event_ids);
+            for person in 0..persons.len() {
+                events[event_starts[person]..event_starts[person + 1]].sort_unstable_by_key(|event| event.ts);
+            }
+
+            // The same grouping for clicks; clicks of people without events can
+            // credit nothing and are dropped.
+            let click_buffers = std::mem::take(&mut *clicks[index].lock().unwrap());
+            let mut click_starts: Vec<usize> = vec![0; persons.len() + 1];
+            let mut click_ids: Vec<u32> = Vec::with_capacity(click_buffers.iter().map(Vec::len).sum());
+            for click in click_buffers.iter().flatten() {
+                let id = ids.get(&click.person).copied().unwrap_or(u32::MAX);
+                if id != u32::MAX {
+                    click_starts[id as usize] += 1;
+                }
+                click_ids.push(id);
+            }
+            let mut sum = 0;
+            for start in click_starts.iter_mut() {
+                let count = *start;
+                *start = sum;
+                sum += count;
+            }
+            let mut clicks: Vec<PersonClick> = vec![PersonClick::default(); sum];
+            let mut cursor: Vec<usize> = click_starts[..persons.len()].to_vec();
+            for (click, &id) in click_buffers.iter().flatten().zip(&click_ids) {
+                if id != u32::MAX {
+                    clicks[cursor[id as usize]] = *click;
+                    cursor[id as usize] += 1;
+                }
+            }
+            drop(click_buffers);
+            drop(click_ids);
+            // Sort each person's clicks by ts, then click_id byte-wise, and drop
+            // identical copies (Clicks 2), which are now neighbours.
+            let mut click_ends: Vec<usize> = vec![0; persons.len()];
+            for person in 0..persons.len() {
+                let (start, end) = (click_starts[person], click_starts[person + 1]);
+                let slice = &mut clicks[start..end];
+                slice.sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| strings.cmp(a.click_id, b.click_id)));
+                let mut kept = 0;
+                for at in 0..slice.len() {
+                    if kept == 0 || slice[kept - 1].click_id != slice[at].click_id {
+                        slice[kept] = slice[at];
+                        kept += 1;
+                    }
+                }
+                click_ends[person] = start + kept;
+            }
 
             let mut sessions: Vec<Session> = Vec::new();
             let mut category_sums: Vec<u64> = vec![0; categories];
             let mut touched: Vec<u16> = Vec::new();
             let mut scratch = AttributionScratch::default();
 
-            let mut next_click = 0;
-            let mut at = 0;
-            while at < events.len() {
-                let person = events[at].person;
-                let mut end = at;
-                while end < events.len() && events[end].person == person {
-                    end += 1;
-                }
-                while next_click < clicks.len() && clicks[next_click].person < person {
-                    next_click += 1;
-                }
-                let click_start = next_click;
-                while next_click < clicks.len() && clicks[next_click].person == person {
-                    next_click += 1;
-                }
-                let person_clicks = &clicks[click_start..next_click];
-
+            for (index, &person) in persons.iter().enumerate() {
+                let (at, end) = (event_starts[index], event_starts[index + 1]);
+                let person_clicks = &clicks[click_starts[index]..click_ends[index]];
                 // Events 5-6: sessions by gaps over 30 minutes between distinct timestamps.
                 sessions.clear();
                 let mut previous = i64::MIN;
@@ -552,7 +615,6 @@ fn sessionize(
                 }
 
                 attribute(&sessions, person_clicks, organic, days, &mut result.campaigns, &mut scratch);
-                at = end;
             }
         },
     )
