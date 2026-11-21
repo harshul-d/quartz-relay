@@ -1,4 +1,4 @@
-READY TO SUBMIT: v9 9a99efddab585ae755382e73e9961363e6a5ae4c (Actions, 20M, warm container median in the same job: v9 1.780 s vs v8 2.130 s on EPYC 9V74, 1.738 vs 2.103 on EPYC 9V45, 1.659 vs 1.730 on Xeon 6975P; v8 scored 1.39 s on the scorer)
+READY TO SUBMIT: v10 fa8f1c12320a4e62972cd0d17c997160c284551a (Actions, 20M, warm container median in one job, v10 vs v8: 1.906 s vs 2.075 on EPYC 7763, 2.156 vs 2.684 on Xeon 8573C, 1.276 vs 1.746 on EPYC 9V45; v9 in the same job 1.983 / 2.333 / 1.430; v8 scored 1.39 s on the scorer)
 
 # Progress
 
@@ -67,6 +67,17 @@ v9 phase breakdown (EPYC 9V74, container warm): lookups 0.008, ID linking 0.089,
 | H5b' | (same, 582bb02, 3 shards) | Shard 1 (EPYC 7763): everything exits in ~0.05 s. Shards 2 and 3 (slow-disk runners): head exit 0.435 / 0.453 s warm (1.79 s cold on shard 3); with `PIPELINE_FSYNC=1` exit 0.05 s and output writing 0.42-0.48 s instead; a probe that only writes 93 MB: exit 0.43 s, or 0.05 s + 0.49 s in main with fsync; probes touching 2 GB or reading all 1.9 GB input: exit 0.05 s | **Confirmed: `docker run` returns only once the container's dirty output is on disk** (the overlay unmount syncs the host filesystem). Cost ~4.6 ms per MB of output on those runners, cold or warm; every pipeline writing ~90 MB of PLAIN Parquet pays ~0.4 s. Fix: write fewer bytes |
 | H7 | Parse: the largest single line in the events/clicks callbacks is `bswap` in `u128::from_be_bytes` of `key::pack_short` (21% / 31% of those symbols): a store-forwarding stall (variable-length memcpy into a stack buffer, then one 16-byte load) | Fixed with `Interner::key_in(chunk, field)`: one 16-byte load from the chunk, masked to the field length (unit test against `pack_short` for every offset/length incl. chunk ends) | Kept (v9). ff86f5e, same job: events parse 1.079 -> 1.020 s, clicks 0.188 -> 0.163 (EPYC 7763); warm -2 to -3% on all three shards |
 | H8 | Output bytes: user_daily dictionary-encoded (dictionary page PLAIN + data page RLE/bit-packed indices, whichever is smaller; user_id one entry per person run, no hashing) | 20M output 93.3 MB -> 20.3 MB, 60M 272.8 -> 57.5 MB; exact match with v1 on 20M/60M; pyarrow/DuckDB/polars identical; `PIPELINE_PLAIN_OUTPUT=1` restores the old layout for A/B. ff86f5e, same job vs PLAIN: Xeon 8573C (slow disk) warm 2.277 -> 1.998 s, cold 5.643 -> 5.380; fast-disk runners -0.5 to -1% | Kept (v9) |
+
+### v10 (fa8f1c1): v9 + early user_daily writes with writeback (H9) + cached date parsing (H10)
+Same job (run fa8f1c1), 20M, container wall medians of 5 (min-max):
+
+| Runner | v8 warm | v9 warm | v10 warm | v8 cold | v10 cold |
+| --- | --- | --- | --- | --- | --- |
+| EPYC 7763 | 2.075 (2.037-2.209) | 1.983 | **1.906** (1.885-1.967) | 5.535 | 5.135 |
+| Xeon 8573C (slow disk) | 2.684 (2.675-2.803) | 2.333 | **2.156** (2.145-2.166) | 9.354 | 8.899 |
+| EPYC 9V45 | 1.746 (1.730-1.796) | 1.430 | **1.276** (1.270-1.341) | 5.475 | 5.067 |
+
+v10 phases, container warm (EPYC 7763 / Xeon 8573C / EPYC 9V45): lookups 0.011 / 0.012 / 0.007; ID linking 0.104 / 0.115 / 0.078; events read+parse 0.935 / 1.050 / 0.611; dedup 0.072 / 0.117 / 0.053; clicks 0.150 / 0.159 / 0.097; sessionize incl. most output encoding 0.455 / 0.533 / 0.312 (cpu-s: group events 0.70 / 0.86 / 0.47, group clicks 0.29 / 0.33 / 0.19, sessions 0.16 / 0.20 / 0.10, attribution 0.46 / 0.51 / 0.34); output writing at the end 0.005 / 0.003 / 0.003; start 0.122 / 0.111 / 0.080; exit 0.052 / 0.050 / 0.038. Linux fixtures and dev answer pass in all 3 shards; 20M output matches v8 in all 3; locally fixtures 36/36, dev MATCH, differential 15/15, 20M exact match with v1, pyarrow/DuckDB check OK.
 
 ### After v9
 | # | Change | Result (same-job warm medians) | Decision |
