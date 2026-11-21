@@ -146,6 +146,7 @@ fn main() {
         .min(64);
     let log = |what: &str| eprintln!("{:>8.3}s {what}", begin.elapsed().as_secs_f64());
 
+    csv::prefetch_inputs(&data);
     let window = read_window(&data.join("manifest.json"));
     let interner = Interner::default();
     let lookups = read_lookups(&data, &interner);

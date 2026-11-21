@@ -62,6 +62,25 @@ def cpu_info():
     return model, os.cpu_count(), flags, lscpu
 
 
+THP_PATH = "/sys/kernel/mm/transparent_hugepage/enabled"
+
+
+def thp_setting(path=THP_PATH):
+    try:
+        return re.search(r"\[(\w+)\]", Path(path).read_text()).group(1)
+    except (OSError, AttributeError):
+        return "?"
+
+
+def set_thp(mode):
+    if mode and thp_setting() != mode:
+        subprocess.run(["sudo", "sh", "-c", f"echo {mode} > {THP_PATH}"], check=True)
+
+
+def warm_cache(data):
+    subprocess.run(["sh", "-c", f"find '{data}' -type f -print0 | xargs -0 cat > /dev/null"], check=True)
+
+
 def drop_caches():
     subprocess.run(["sync"], check=True)
     subprocess.run(["sudo", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"], check=True)
@@ -82,6 +101,9 @@ def docker_args(image, data, out, scratch, cpus, mem, env=(), entry=None):
             "-v", f"{data}:/data:ro,z", "-v", f"{out}:/output:z", "-v", f"{scratch}:/scratch:z",
             "-e", "DATA_DIR=/data", "-e", "OUTPUT_DIR=/output", "-e", "SCRATCH_DIR=/scratch", "-e", "HOME=/scratch",
             "-e", f"NCPU={int(float(cpus))}", "-e", f"MEM_GB={mem.rstrip('g')}"]
+    if any(item.startswith("NCPU=") for item in env):  # a thread-count experiment replaces NCPU
+        at = args.index(f"NCPU={int(float(cpus))}")
+        del args[at - 1:at + 1]
     for item in env:
         args += ["-e", item]
     if entry:
@@ -117,6 +139,10 @@ def phase_durations(phases, wall):
 
 class Variant:
     def __init__(self, name, ref, env):
+        # THP=always|madvise|never is a machine setting applied around this
+        # variant's runs, not container environment.
+        self.thp = next((e.split("=", 1)[1] for e in env if e.startswith("THP=")), None)
+        env = [e for e in env if not e.startswith("THP=")]
         self.name, self.ref, self.env = name, ref, env
         self.image = f"pipeline:{name}"
         self.binary = None
@@ -213,10 +239,10 @@ def timed_native(v, data, work, cpus):
     return wall, p.stderr, stats
 
 
-def timed_cat(data, cpus):
+def timed_cat(data, readers):
     files = [str(p) for p in sorted(Path(data).rglob("*")) if p.is_file()]
     begin = time.perf_counter()
-    subprocess.run(["xargs", "-0", "-P", str(int(float(cpus))), "-n", "4", "cat"],
+    subprocess.run(["xargs", "-0", "-P", str(readers), "-n", "4", "cat"],
                    input="\0".join(files).encode(), stdout=subprocess.DEVNULL, check=True)
     return time.perf_counter() - begin
 
@@ -258,14 +284,19 @@ def main():
     container = {}  # (variant, mode) -> walls
     stderr_runs = {}  # (variant, mode) -> [(wall, stderr)]
     native = {}  # variant -> [(wall, stats, stderr)]
-    cats = {"cold": [], "warm": []}
+    cats = {}
+    default_thp = thp_setting()
+    default_defrag = thp_setting(Path(THP_PATH).with_name("defrag"))
+    readers = sorted({int(cpus), 16})
 
     # Untimed warm-up: images, binaries and input into the page cache.
     for v in variants:
+        set_thp(v.thp or default_thp)
         timed_container(v, data, work, cpus, a.mem, keep=work / f"result-{v.name}")
     for rep in range(a.reps):
         order = variants[rep % len(variants):] + variants[:rep % len(variants)]
         for v in order:
+            set_thp(v.thp or default_thp)
             for mode in ("cold", "warm"):
                 if mode == "cold":
                     drop_caches()
@@ -279,13 +310,16 @@ def main():
                 trivial.image = v.image
                 wall, _ = timed_container(trivial, data, work, cpus, a.mem, entry="/bin/true")
                 container.setdefault((f"{v.name} /bin/true", mode), []).append(wall)
+            warm_cache(data)  # the /bin/true cold run dropped the input from the cache
             wall, err, stats = timed_native(v, data, work, cpus)
             native.setdefault(v.name, []).append((wall, stats, err))
             log(f"rep {rep} {v.name} native: {wall:.3f}s")
-        for mode in ("cold", "warm"):
-            if mode == "cold":
-                drop_caches()
-            cats[mode].append(timed_cat(data, cpus))
+        set_thp(default_thp)
+        for n in readers:
+            for mode in ("cold", "warm"):
+                if mode == "cold":
+                    drop_caches()
+                cats.setdefault((n, mode), []).append(timed_cat(data, n))
 
     # Correctness of the timed runs: every variant's 20M output against the first.
     checks = []
@@ -306,14 +340,17 @@ def main():
         md.append(f"- NOTE: {note}")
     md.append(f"- Data: `{data.name}`, {data_bytes / 1e9:.2f} GB; {a.reps} repetitions; docker flags of "
               f"scripts/docker_run.sh with --cpus {cpus} --memory {a.mem}")
-    md.append(f"- Variants: " + "; ".join(f"`{v.name}` = {v.ref} {' '.join(v.env)}".strip() for v in variants))
+    md.append(f"- Transparent huge pages: runner default `{default_thp}`, defrag `{default_defrag}`")
+    md.append("- Variants: " + "; ".join(
+        f"`{v.name}` = {v.ref} {' '.join(v.env)}{' THP=' + v.thp if v.thp else ''}".strip() for v in variants))
     md += ["", "## Wall time, seconds: median (min-max)", "", "| Run | cold | warm |", "| --- | --- | --- |"]
     names = [v.name for v in variants] + [f"{v.name} /bin/true" for v in variants]
     for name in names:
         md.append(f"| {name} | {fmt(container.get((name, 'cold'), []))} | {fmt(container.get((name, 'warm'), []))} |")
     for v in variants:
         md.append(f"| {v.name} native (warm) | - | {fmt([w for w, _, _ in native[v.name]])} |")
-    md.append(f"| cat of all input, {cpus} readers | {fmt(cats['cold'])} | {fmt(cats['warm'])} |")
+    for n in readers:
+        md.append(f"| cat of all input, {n} readers | {fmt(cats[(n, 'cold')])} | {fmt(cats[(n, 'warm')])} |")
 
     for v in variants:
         md += ["", f"## Phases of `{v.name}` (seconds, median over runs)", ""]

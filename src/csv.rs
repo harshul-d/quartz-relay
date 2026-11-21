@@ -334,6 +334,42 @@ impl Files {
     }
 }
 
+/// Experiment (`PIPELINE_WILLNEED=1`): asks the kernel, from a background
+/// thread, to start reading every input file now (`POSIX_FADV_WILLNEED`), in
+/// the order the tables are processed, so cold reads overlap other work.
+pub fn prefetch_inputs(data: &Path) {
+    if std::env::var_os("PIPELINE_WILLNEED").is_none_or(|v| v != "1") {
+        return;
+    }
+    let data = data.to_path_buf();
+    std::thread::spawn(move || {
+        for table in ["links", "events", "clicks"] {
+            let Ok(entries) = std::fs::read_dir(data.join(table)) else { continue };
+            let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+            paths.sort();
+            for path in paths {
+                if let Ok(file) = File::open(&path) {
+                    will_need(&file);
+                }
+            }
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn will_need(file: &File) {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn posix_fadvise(fd: i32, offset: i64, len: i64, advice: i32) -> i32;
+    }
+    const POSIX_FADV_WILLNEED: i32 = 3;
+    // SAFETY: a valid open descriptor; the call only gives the kernel a hint.
+    unsafe { posix_fadvise(file.as_raw_fd(), 0, 0, POSIX_FADV_WILLNEED) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn will_need(_file: &File) {}
+
 #[derive(Clone, Copy)]
 pub struct Chunk {
     pub file: usize,
