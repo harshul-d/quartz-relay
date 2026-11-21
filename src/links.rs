@@ -175,7 +175,7 @@ pub fn build_linked(data: &Path, interner: &Interner, threads: usize, chunk_byte
     let files = Files::open_folder(&data.join("links"));
     // The link files are small next to the events: about 16 chunks per thread,
     // so every thread has work (2 MB chunks left ~25 for the whole 20M set).
-    let target = (files.total_bytes() / (threads.max(1) as u64 * 16)).clamp(64 << 10, chunk_bytes);
+    let target = (files.total_bytes() / (threads.max(1) as u64 * 16)).max(64 << 10).min(chunk_bytes);
     let chunks = files.chunks(target);
 
     // 1. Parse (Linked IDs 1): valid pairs, and each endpoint by partition.
