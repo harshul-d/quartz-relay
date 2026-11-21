@@ -2,7 +2,5 @@
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
 v10      v10
-prev     88429c23441ffafba5fb6c86fdfeb612300d0502
+head-nt0 HEAD  PIPELINE_NT=0
 head     HEAD
-chunk4m  HEAD  PIPELINE_CHUNK_KB=4096
-chunk8m  HEAD  PIPELINE_CHUNK_KB=8192

@@ -22,6 +22,7 @@ mod key;
 mod links;
 mod out;
 mod par;
+mod scatter;
 mod timing;
 mod ts;
 
@@ -41,6 +42,7 @@ const MI_OPTION_PURGE_DELAY: i32 = 15;
 
 use csv::{Files, for_each_line, for_each_record, split};
 use key::{FastMap, Interner, Key, Strings, hash};
+use scatter::Scatter;
 use ts::{DAY, HOUR, MINUTE};
 
 const SESSION_GAP: i64 = 30 * MINUTE;
@@ -310,6 +312,8 @@ fn parse_events(
     threads: usize,
 ) -> ParsedEvents {
     let skip: u8 = std::env::var("PIPELINE_SKIP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    // `PIPELINE_NT=0` (A/B only): plain pushes instead of streaming pairs.
+    let streaming = std::env::var_os("PIPELINE_NT").is_none_or(|v| v != "0");
     let files = Files::open_folder(&data.join("events"));
     let chunks = files.chunks(chunk_bytes());
     // Event lines average ~75 bytes; reserve for a little more rows than that,
@@ -332,8 +336,8 @@ fn parse_events(
     const BATCH: usize = 32;
     struct State {
         thread: usize,
-        people: Vec<Vec<PersonEvent>>,
-        copies: Vec<Vec<EventCopy>>,
+        people: Scatter<PersonEvent>,
+        copies: Scatter<EventCopy>,
         pending: Vec<Pending>,
         dates: ts::Parser,
         /// Diagnostics only (`PIPELINE_SKIP`, wrong output): bit 0 skips the
@@ -360,13 +364,14 @@ fn parse_events(
             } else {
                 (row.user, partition_of_hash(row.hashed))
             };
-            let buffer = &mut state.people[part];
-            let location = location_of(part, state.thread, buffer.len());
+            let location = location_of(part, state.thread, state.people.len(part));
             if state.skip & 2 == 0 {
-                buffer.push(PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags });
+                let event = PersonEvent { person, ts: row.ts, price: row.price, category: row.category, flags: row.flags };
+                state.people.push(part, event);
             }
             if state.skip & 1 == 0 {
-                state.copies[partition(row.event_id)].push(EventCopy { event_id: row.event_id, ingest: row.ingest, location });
+                let copy = EventCopy { event_id: row.event_id, ingest: row.ingest, location };
+                state.copies.push(partition(row.event_id), copy);
             }
         }
         state.pending.clear();
@@ -376,8 +381,8 @@ fn parse_events(
         chunks.len(),
         |thread| State {
             thread,
-            people: sized_partitions(capacity),
-            copies: sized_partitions(capacity),
+            people: Scatter::new(PARTITIONS, capacity, streaming),
+            copies: Scatter::new(PARTITIONS, capacity, streaming),
             pending: Vec::with_capacity(BATCH),
             dates: ts::Parser::default(),
             skip,
@@ -435,17 +440,21 @@ fn parse_events(
                     }
                     // Failed validation: only the dedup copy is kept.
                     if state.skip & 1 == 0 {
-                        state.copies[partition(event_id)].push(EventCopy { event_id, ingest, location: INVALID });
+                        state.copies.push(partition(event_id), EventCopy { event_id, ingest, location: INVALID });
                     }
                 });
                 flush(state, names);
             });
+            state.people.fence();
+            state.copies.fence();
         },
-    );    let mut people = Vec::with_capacity(states.len());
+    );
+    let mut people = Vec::with_capacity(states.len());
     let mut copies = Vec::with_capacity(states.len());
     for state in states {
-        people.push(state.people);
-        copies.push(state.copies);
+        // Each worker fenced its streaming stores after every chunk.
+        people.push(state.people.finish());
+        copies.push(state.copies.finish());
     }
     ParsedEvents { people: transpose(people), copies: transpose(copies) }
 }
