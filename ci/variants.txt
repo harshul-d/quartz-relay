@@ -1,8 +1,6 @@
 # name  git-ref  [KEY=VALUE ...]  (extra container environment for flag-gated experiments;
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
-head            HEAD
-head-madvise    HEAD  THP=madvise
-head-madv-large HEAD  THP=madvise MIMALLOC_ALLOW_LARGE_OS_PAGES=1
-head-large      HEAD  MIMALLOC_ALLOW_LARGE_OS_PAGES=1
-head-willneed   HEAD  PIPELINE_WILLNEED=1
+v8        v8
+head      HEAD
+head-t2x  HEAD  NCPU=8

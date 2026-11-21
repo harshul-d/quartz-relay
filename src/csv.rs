@@ -334,11 +334,12 @@ impl Files {
     }
 }
 
-/// Experiment (`PIPELINE_WILLNEED=1`): asks the kernel, from a background
-/// thread, to start reading every input file now (`POSIX_FADV_WILLNEED`), in
-/// the order the tables are processed, so cold reads overlap other work.
+/// Asks the kernel, from a background thread, to start reading every input
+/// file now (`POSIX_FADV_WILLNEED`), in the order the tables are processed,
+/// so cold reads run ahead of parsing and overlap other work (measured: -5%
+/// cold, no change warm). `PIPELINE_WILLNEED=0` turns it off for A/B runs.
 pub fn prefetch_inputs(data: &Path) {
-    if std::env::var_os("PIPELINE_WILLNEED").is_none_or(|v| v != "1") {
+    if std::env::var_os("PIPELINE_WILLNEED").is_some_and(|v| v == "0") {
         return;
     }
     let data = data.to_path_buf();

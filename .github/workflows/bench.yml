@@ -97,6 +97,33 @@ jobs:
             --report /tmp/report.md --reps 5
           cat /tmp/report.md >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Profile (first variant, native, warm)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y -qq linux-tools-common "linux-tools-$(uname -r)" > /dev/null 2>&1 \
+            || sudo apt-get install -y -qq linux-tools-generic > /dev/null 2>&1 || true
+          perf=$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | head -n 1); [ -n "$perf" ] || perf=perf
+          sudo sysctl -q kernel.perf_event_paranoid=-1 kernel.kptr_restrict=0
+          # HEAD built natively like the image, plus line tables (codegen unchanged).
+          RUSTFLAGS="-C target-cpu=x86-64-v3" CARGO_PROFILE_RELEASE_DEBUG=line-tables-only \
+            cargo build --release --quiet
+          find "$DATA/big" -type f -print0 | xargs -0 cat > /dev/null
+          out=$(mktemp -d)
+          DATA_DIR="$DATA/big" OUTPUT_DIR="$out" NCPU=$(nproc) $perf record -q -F 2999 -o /tmp/perf.data target/release/pipeline 2> /tmp/perf-run.txt
+          {
+            echo; echo "## Profile of HEAD (perf, native, warm; self time)"; echo; echo '```'
+            $perf report -i /tmp/perf.data --stdio --sort dso 2>/dev/null | grep -v '^#' | grep -v '^$' | head -n 12
+            echo
+            $perf report -i /tmp/perf.data --stdio --sort sym 2>/dev/null | grep -v '^#' | grep -v '^$' | head -n 45
+            echo '```'
+            echo; echo "### Hottest source lines per symbol"; echo; echo '```'
+            timeout 600 $perf annotate -i /tmp/perf.data --stdio -l 2>/dev/null \
+              | awk '/Percent \|/ {print; next} /^ +[0-9]+\.[0-9]+ +[^ ]+:[0-9]+/ && $1 >= 0.4 {print}' | head -n 250
+            echo '```'
+          } > /tmp/profile.md
+          cat /tmp/profile.md >> /tmp/report.md
+          cat /tmp/profile.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Publish results
         if: always()
         run: |
