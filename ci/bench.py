@@ -225,15 +225,16 @@ TIME_FIELDS = {
 }
 
 
-def timed_native(v, data, work, cpus):
+def timed_native(v, data, work, cpus, threads=None):
     out = work / "native-out"
     if out.exists():
         remove(out)
     out.mkdir()
-    env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), NCPU=str(int(float(cpus))))
+    env = dict(os.environ, DATA_DIR=str(data), OUTPUT_DIR=str(out), NCPU=str(threads or int(float(cpus))))
     for item in v.env:
         key, _, value = item.partition("=")
-        env[key] = value
+        if not (threads and key == "NCPU"):
+            env[key] = value
     start_ns = time.time_ns()
     begin = time.perf_counter()
     p = subprocess.run(["/usr/bin/time", "-v", str(v.binary)], capture_output=True, text=True, env=env)
@@ -280,6 +281,7 @@ def main():
     ap.add_argument("--reps", type=int, default=5)
     ap.add_argument("--mem", default="24g")
     ap.add_argument("--compare", default=str(ROOT / "scripts" / "compare.py"))
+    ap.add_argument("--scaling", default="", help="variant names to run natively with 1, 2, 4 threads")
     a = ap.parse_args()
 
     data = Path(a.data).resolve()
@@ -332,6 +334,20 @@ def main():
                     drop_caches()
                 cats.setdefault((n, mode), []).append(timed_cat(data, n))
 
+    # Thread scaling, natively and warm: which phases do not scale.
+    scaling = {}  # (variant, threads) -> [(wall, stats, stderr)]
+    scaled = [v for v in variants if v.name in a.scaling.split(",")]
+    if scaled:
+        warm_cache(data)
+        for rep in range(3):
+            for v in scaled:
+                set_thp(v.thp or default_thp)
+                for n in (1, 2, 4):
+                    wall, err, stats = timed_native(v, data, work, cpus, threads=n)
+                    scaling.setdefault((v.name, n), []).append((wall, stats, err))
+                    log(f"scaling rep {rep} {v.name} {n} threads: {wall:.3f}s")
+        set_thp(default_thp)
+
     # Correctness of the timed runs: every variant's 20M output against the first.
     checks = []
     base = work / f"result-{variants[0].name}"
@@ -362,6 +378,36 @@ def main():
         md.append(f"| {v.name} native (warm) | - | {fmt([w for w, _, _ in native[v.name]])} |")
     for n in readers:
         md.append(f"| cat of all input, {n} readers | {fmt(cats[(n, 'cold')])} | {fmt(cats[(n, 'warm')])} |")
+
+    md += ["", "## CPU (native, warm): median seconds", "", "| Variant | wall | user | sys | user+sys |",
+           "| --- | --- | --- | --- | --- |"]
+    for v in variants:
+        runs = native[v.name]
+        med = lambda key: statistics.median([s.get(key, 0) for _, s, _ in runs])
+        total = statistics.median([s.get("user s", 0) + s.get("system s", 0) for _, s, _ in runs])
+        md.append(f"| {v.name} | {statistics.median([w for w, _, _ in runs]):.3f} | {med('user s'):.2f} | "
+                  f"{med('system s'):.2f} | **{total:.2f}** |")
+
+    if scaling:
+        for v in scaled:
+            md += ["", f"## Thread scaling of `{v.name}` (native, warm, median of 3; seconds)", ""]
+            cols = [1, 2, 4]
+            rows = {}
+            for n in cols:
+                for wall, stats, err in scaling[(v.name, n)]:
+                    phases, _ = parse_stderr(err)
+                    for k, val in phase_durations(phases, wall).items():
+                        rows.setdefault(k, {}).setdefault(n, []).append(val)
+                    rows.setdefault("wall", {}).setdefault(n, []).append(wall)
+                    rows.setdefault("user+sys", {}).setdefault(n, []).append(
+                        stats.get("user s", 0) + stats.get("system s", 0))
+            md += ["| Phase | 1 thread | 2 threads | 4 threads | speed-up 1->4 |", "| --- | --- | --- | --- | --- |"]
+            for k, per in rows.items():
+                if k.startswith(("start:", "exit:", "outside")):
+                    continue
+                meds = [statistics.median(per[n]) if n in per else float("nan") for n in cols]
+                speed = meds[0] / meds[2] if meds[2] > 0 else float("nan")
+                md.append(f"| {k} | " + " | ".join(f"{m:.3f}" for m in meds) + f" | {speed:.2f}x |")
 
     for v in variants:
         md += ["", f"## Phases of `{v.name}` (seconds, median over runs)", ""]

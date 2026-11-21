@@ -170,9 +170,20 @@ fn main() {
 
     let events = parse_events(&data, &interner, &names, &lookups, &window, threads);
     log("events parsed");
-    let deletions = dedup_events(events.copies, threads);
-    log("events deduplicated");
-    let clicks = parse_clicks(&data, &interner, &names, &lookups, &window, threads);
+    // Dedup and clicks are independent: run them side by side, so neither
+    // phase's tail leaves cores idle. `PIPELINE_OVERLAP=0` (A/B only) runs
+    // them one after the other.
+    let (deletions, clicks) = if std::env::var_os("PIPELINE_OVERLAP").is_some_and(|v| v == "0") {
+        let deletions = dedup_events(events.copies, threads);
+        log("events deduplicated");
+        (deletions, parse_clicks(&data, &interner, &names, &lookups, &window, threads))
+    } else {
+        std::thread::scope(|scope| {
+            let dedup = scope.spawn(|| dedup_events(events.copies, threads));
+            let clicks = parse_clicks(&data, &interner, &names, &lookups, &window, threads);
+            (dedup.join().expect("dedup thread"), clicks)
+        })
+    };
     log("clicks parsed");
     drop(names);
     let strings = interner.finish();

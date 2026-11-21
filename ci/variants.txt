@@ -1,6 +1,11 @@
 # name  git-ref  [KEY=VALUE ...]  (extra container environment for flag-gated experiments;
 # THP=always|madvise|never sets the runner's transparent huge pages around that variant's runs)
 # The first line is the baseline the others are checked against.
-v8    v8
-v10   v10
-head  HEAD
+# ci/scaling.txt names the variants also run natively with 1, 2 and 4 threads.
+v10         v10
+head-noovl  HEAD  PIPELINE_OVERLAP=0
+head        HEAD
+mmap        HEAD  PIPELINE_READ=mmap
+mmap-pop    HEAD  PIPELINE_READ=mmap-populate
+mmap-seq    HEAD  PIPELINE_READ=mmap-seq
+mmap-chunk  HEAD  PIPELINE_READ=mmap-chunk

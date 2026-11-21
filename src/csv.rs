@@ -242,6 +242,114 @@ pub fn read_data_lines(path: &Path) -> Vec<u8> {
 pub struct Files {
     files: Vec<File>,
     lengths: Vec<u64>,
+    /// Memory maps of the files (Linux, `PIPELINE_READ=mmap*`), else empty.
+    maps: Vec<Map>,
+    populate_chunks: bool,
+}
+
+/// How input is read: `PIPELINE_READ` = `pread` (default), `mmap` (lazy),
+/// `mmap-populate` (MAP_POPULATE), `mmap-seq` (MADV_SEQUENTIAL),
+/// `mmap-willneed` (MADV_WILLNEED), `mmap-chunk` (MADV_POPULATE_READ per
+/// chunk, in the worker that parses it).
+#[derive(Clone, Copy, PartialEq)]
+enum ReadMode {
+    Pread,
+    Mmap { flags: i32, advice: i32, chunk: bool },
+}
+
+fn read_mode() -> ReadMode {
+    static MODE: std::sync::OnceLock<ReadMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| {
+        const MAP_POPULATE: i32 = 0x8000;
+        const MADV_SEQUENTIAL: i32 = 2;
+        const MADV_WILLNEED: i32 = 3;
+        let mode = std::env::var("PIPELINE_READ").unwrap_or_default();
+        let mmap = |flags, advice, chunk| ReadMode::Mmap { flags, advice, chunk };
+        match mode.as_str() {
+            _ if !cfg!(target_os = "linux") => ReadMode::Pread,
+            "mmap" => mmap(0, 0, false),
+            "mmap-populate" => mmap(MAP_POPULATE, 0, false),
+            "mmap-seq" => mmap(0, MADV_SEQUENTIAL, false),
+            "mmap-willneed" => mmap(0, MADV_WILLNEED, false),
+            "mmap-chunk" => mmap(0, 0, true),
+            _ => ReadMode::Pread,
+        }
+    })
+}
+
+/// A read-only private mapping of a whole file.
+struct Map {
+    at: *const u8,
+    length: usize,
+}
+
+// SAFETY: the mapping is read-only and lives as long as the `Map`.
+unsafe impl Send for Map {}
+unsafe impl Sync for Map {}
+
+#[cfg(target_os = "linux")]
+mod sys {
+    unsafe extern "C" {
+        pub fn mmap(addr: *mut u8, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        pub fn munmap(addr: *mut u8, length: usize) -> i32;
+        pub fn madvise(addr: *mut u8, length: usize, advice: i32) -> i32;
+    }
+    pub const PROT_READ: i32 = 1;
+    pub const MAP_PRIVATE: i32 = 2;
+    pub const MADV_POPULATE_READ: i32 = 22;
+}
+
+impl Map {
+    #[cfg(target_os = "linux")]
+    fn new(file: &File, length: u64, flags: i32, advice: i32) -> Option<Map> {
+        use std::os::fd::AsRawFd;
+        let length = length as usize;
+        // SAFETY: a fresh read-only private mapping of an open file.
+        let at = unsafe {
+            sys::mmap(std::ptr::null_mut(), length, sys::PROT_READ, sys::MAP_PRIVATE | flags, file.as_raw_fd(), 0)
+        };
+        if at as isize == -1 || at.is_null() {
+            return None;
+        }
+        if advice != 0 {
+            // SAFETY: the range is the mapping just made; advice is a hint.
+            unsafe { sys::madvise(at, length, advice) };
+        }
+        Some(Map { at, length })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn new(_file: &File, _length: u64, _flags: i32, _advice: i32) -> Option<Map> {
+        None
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: the mapping covers `length` readable bytes while `self` lives.
+        unsafe { std::slice::from_raw_parts(self.at, self.length) }
+    }
+
+    /// Faults `range` in with one call (MADV_POPULATE_READ, Linux 5.14+).
+    fn populate(&self, start: usize, end: usize) {
+        #[cfg(target_os = "linux")]
+        {
+            const PAGE: usize = 4096;
+            let from = start & !(PAGE - 1);
+            // SAFETY: a page-aligned range inside the mapping; only a hint.
+            unsafe { sys::madvise(self.at.add(from) as *mut u8, end - from, sys::MADV_POPULATE_READ) };
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (start, end);
+    }
+}
+
+impl Drop for Map {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        // SAFETY: unmapping the mapping this `Map` owns.
+        unsafe {
+            sys::munmap(self.at as *mut u8, self.length);
+        }
+    }
 }
 
 impl Files {
@@ -277,7 +385,17 @@ impl Files {
                 lengths.push(length);
             }
         }
-        Files { files, lengths }
+        let mut maps = Vec::new();
+        let mut populate_chunks = false;
+        if let ReadMode::Mmap { flags, advice, chunk } = read_mode() {
+            let mapped: Option<Vec<Map>> =
+                files.iter().zip(&lengths).map(|(file, &length)| Map::new(file, length, flags, advice)).collect();
+            if let Some(mapped) = mapped {
+                maps = mapped;
+                populate_chunks = chunk;
+            }
+        }
+        Files { files, lengths, maps, populate_chunks }
     }
 
     /// Total size of all the files, in bytes.
@@ -326,6 +444,15 @@ impl Files {
 
     /// Reads one chunk into this thread's reused buffer and hands it to `f`.
     pub fn with_chunk<R>(&self, chunk: &Chunk, f: impl FnOnce(&[u8]) -> R) -> R {
+        if let Some(map) = self.maps.get(chunk.file) {
+            let (start, end) = (chunk.start as usize, chunk.end as usize);
+            if self.populate_chunks {
+                let begin = std::time::Instant::now();
+                map.populate(start, end);
+                crate::timing::READ.add_since(begin);
+            }
+            return f(&map.bytes()[start..end]);
+        }
         thread_local! {
             static BUFFER: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
