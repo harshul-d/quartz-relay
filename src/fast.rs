@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use super::*;
 use crate::csv::{Files, for_each_record};
 use crate::key::{FastMap, Interner, Key, Strings, is_long};
-use crate::links::{Linked, Names};
+use crate::links::Linked;
 
 // ------------------------------------------------------------------ IDs
 
@@ -496,17 +496,22 @@ pub struct Prepared {
     others: Vec<Vec<Key>>,
     /// Per person: the shard of their surviving events, or HOME_*.
     home: Vec<AtomicU32>,
-    /// Per person: the root of their linked aliases, or LINK_*.
-    link_root: Vec<u32>,
-    /// Per person with a root: which aliases (all below 64) are linked.
-    link_aliases: Vec<u64>,
+    /// Every user's person key.
+    persons: Persons,
     /// Linked IDs by dense id (for root names).
-    linked_keys: Vec<Key>,
+    linked_keys: std::sync::Arc<Vec<Key>>,
     /// `[thread][shard]` clicks of persons finished in a shard.
     local_clicks: Vec<Vec<Vec<LocalClick>>>,
     /// Clicks for the general path, `[partition][thread]`.
     general_clicks: Partitioned<PersonClick>,
     stats: Stats,
+}
+
+impl Prepared {
+    /// For `Strings::set_resolver`: names this run's tagged person keys.
+    pub fn resolver(&self) -> impl Fn(Key) -> Key + Send + Sync + 'static {
+        resolver(self.linked_keys.clone(), self.keys.user)
+    }
 }
 
 #[derive(Default)]
@@ -540,7 +545,6 @@ fn off(reason: &str) -> Option<Prepared> {
 pub fn prepare(
     data: &Path,
     interner: &Interner,
-    names: &Names,
     linked: Linked,
     lookups: &Lookups,
     window: &Window,
@@ -590,8 +594,8 @@ pub fn prepare(
         let parsed = parse_events(&files, &chunks, interner, lookups, window, threads, &keys, shard_bits);
         (classify.join().unwrap(), parsed)
     });
-    let ((link_root, link_aliases), states) = classified;
-    let linked_keys = linked.keys;
+    let (persons_of, states) = classified;
+    let linked_keys = std::sync::Arc::new(linked.keys);
     let shards = ((keys.events >> shard_bits) + 1) as usize;
     if let Some(reason) = states.iter().find_map(|state| state.abort) {
         return off(reason);
@@ -700,7 +704,7 @@ pub fn prepare(
     }
     // A person who is not simple is finished on the general path too: one
     // lookup then answers both questions for every click.
-    for (at, &root) in home.iter().zip(&link_root) {
+    for (at, &root) in home.iter().zip(&persons_of.link_root) {
         if root == LINK_COMPLEX {
             at.store(HOME_MULTI, Relaxed);
         }
@@ -722,13 +726,12 @@ pub fn prepare(
     }
     /// Clicks waiting in `pending` while their `home` entries load.
     const AHEAD: usize = 16;
-    let user_key = keys.user;
     let route = |state: &mut ClickState| {
         for click in state.pending.drain(..) {
             let at = home[(click.user >> ALIAS_BITS) as usize].load(Relaxed);
             if at == HOME_MULTI {
                 // The ID is canonical, so this is its exact key.
-                let person = names.person(encode(b'u', scramble(click.user as u64, user_key)));
+                let person = tagged(persons_of.of_user(click.user));
                 let LocalClick { click_id, ts, campaign, .. } = click;
                 state.general[partition(person)].push(PersonClick { person, click_id, ts, campaign });
             } else if at != HOME_NONE {
@@ -765,7 +768,7 @@ pub fn prepare(
                         }
                         return;
                     }
-                    let person = names.person(interner.key_in(bytes, user));
+                    let person = persons_of.of_other(interner.key_in(bytes, user));
                     state.general[partition(person)].push(PersonClick { person, click_id, ts, campaign });
                 });
             });
@@ -788,8 +791,7 @@ pub fn prepare(
         odd,
         others,
         home,
-        link_root,
-        link_aliases,
+        persons: persons_of,
         linked_keys,
         local_clicks,
         general_clicks: transpose(general),
@@ -930,30 +932,33 @@ fn parse_events(
 /// linked, LINK_NONE when none is, or LINK_COMPLEX when the person is not
 /// simple: aliases in several sets, an alias of 64 or more, or a set that
 /// also holds another person's ID or an ID that does not decode.
-fn classify_links(linked: &Linked, keys: &Keys, threads: usize) -> (Vec<u32>, Vec<u64>) {
+fn classify_links(linked: &Linked, keys: &Keys, threads: usize) -> Persons {
     let count = linked.keys.len();
     let persons = keys.persons as usize;
     let mut link_root = vec![LINK_NONE; persons];
     let mut link_aliases = vec![0u64; persons];
+    let mut complex: FastMap<u32, u32> = FastMap::default();
+    let mut other_roots: FastMap<Key, u32> = FastMap::default();
     // (user number, root) of every decodable linked ID; roots with any other
     // ID are complex.
     const BLOCK: usize = 1 << 16;
     let blocks = count.div_ceil(BLOCK);
-    let parts = par::run(threads, blocks, |_| (Vec::new(), Vec::new()), |(dense, other): &mut (Vec<(u32, u32)>, Vec<u32>), block| {
+    let parts = par::run(threads, blocks, |_| (Vec::new(), Vec::new()), |(dense, other): &mut (Vec<(u32, u32)>, Vec<(Key, u32)>), block| {
         for x in block * BLOCK..((block + 1) * BLOCK).min(count) {
             let key = linked.keys[x];
             let decoded = key_bytes(key).and_then(|(bytes, n)| decode_bytes(&bytes[..n], b'u'));
             match dense_user(decoded, keys.user, keys.persons) {
                 Some(v) => dense.push((v, linked.roots[x])),
-                None => other.push(linked.roots[x]),
+                None => other.push((key, linked.roots[x])),
             }
         }
     });
     let mut complex_root = vec![false; count];
     let mut nodes: Vec<(u32, u32)> = Vec::new();
     for (dense, other) in parts {
-        for root in other {
+        for (key, root) in other {
             complex_root[root as usize] = true;
+            other_roots.insert(key, root);
         }
         nodes.extend(dense);
     }
@@ -985,10 +990,82 @@ fn classify_links(linked: &Linked, keys: &Keys, threads: usize) -> (Vec<u32>, Ve
             link_aliases[person as usize] = nodes[k..r].iter().fold(0, |mask, &(v, _)| mask | 1 << (v & 63));
         } else {
             link_root[person as usize] = LINK_COMPLEX;
+            complex.extend(nodes[k..r].iter().copied());
         }
         k = r;
     }
-    (link_root, link_aliases)
+    Persons { link_root, link_aliases, complex, other_roots }
+}
+
+/// Who every user is, as an integer person key: the root of their link set
+/// (ROOT | root) or, unlinked, their user number. Keys go through
+/// `sessionize` tagged (`tagged`), and `Strings` turns them into names when
+/// the rows are written, so no row needs a name lookup.
+struct Persons {
+    /// Per person number: the root of their linked aliases, or LINK_*.
+    link_root: Vec<u32>,
+    /// Per person number with a root: which aliases (all below 64) are linked.
+    link_aliases: Vec<u64>,
+    /// Linked user numbers of persons that are not simple, with their roots.
+    complex: FastMap<u32, u32>,
+    /// Linked IDs that do not decode, with their roots.
+    other_roots: FastMap<Key, u32>,
+}
+
+impl Persons {
+    #[inline(always)]
+    fn root_of(&self, v: u32) -> Option<u32> {
+        let person = (v >> ALIAS_BITS) as usize;
+        match self.link_root[person] {
+            LINK_NONE => None,
+            LINK_COMPLEX => self.complex.get(&v).copied(),
+            root => {
+                let alias = v & ((1 << ALIAS_BITS) - 1);
+                (alias < 64 && self.link_aliases[person] >> alias & 1 == 1).then_some(root)
+            }
+        }
+    }
+
+    /// The person key of a user number.
+    #[inline(always)]
+    fn of_user(&self, v: u32) -> u64 {
+        match self.root_of(v) {
+            Some(root) => ROOT | root as u64,
+            None => v as u64,
+        }
+    }
+
+    /// The `sessionize` key of an ID that does not decode: tagged root when
+    /// it is linked, else the ID itself (it is its own name).
+    #[inline(always)]
+    fn of_other(&self, key: Key) -> Key {
+        match self.other_roots.get(&key) {
+            Some(&root) => tagged(ROOT | root as u64),
+            None => key,
+        }
+    }
+}
+
+/// The low byte of a tagged person key; packed keys hold a length (at most
+/// 15) there and interned ones 0xFF.
+const TAG: u128 = 0xFE;
+
+#[inline(always)]
+fn tagged(person: u64) -> Key {
+    (person as u128) << 8 | TAG
+}
+
+/// Turns tagged person keys into names: the root's ID, or the user's ID.
+pub fn resolver(linked_keys: std::sync::Arc<Vec<Key>>, user_key: u64) -> impl Fn(Key) -> Key + Send + Sync {
+    move |key: Key| {
+        debug_assert_eq!(key & 0xFF, TAG);
+        let person = (key >> 8) as u64;
+        if person & ROOT != 0 {
+            linked_keys[(person & !ROOT) as usize]
+        } else {
+            encode(b'u', scramble(person, user_key))
+        }
+    }
 }
 
 // ---------------------------------------------------------------- stage 2
@@ -997,7 +1074,6 @@ fn classify_links(linked: &Linked, keys: &Keys, threads: usize) -> (Vec<u32>, Ve
 /// results, with the rest of the events and clicks for `sessionize`.
 pub fn finish(
     prepared: Prepared,
-    names: &Names,
     lookups: &Lookups,
     window: &Window,
     strings: &Strings,
@@ -1010,20 +1086,18 @@ pub fn finish(
         odd,
         others,
         home,
-        link_root,
-        link_aliases,
+        persons,
         linked_keys,
         local_clicks,
         general_clicks,
-        mut stats,
+        stats,
     } = prepared;
     let organic = lookups.campaign_names.len();
     let shards = survivors.len();
-    let user_key = keys.user;
-    // A user number's ID, and the name of its person (as `Names::person`).
-    let user_id = |v: u32| encode(b'u', scramble(v as u64, user_key));
+    drop((keys, linked_keys));
     let other_id = |user: u32| others[((user & !OTHER) >> OTHER_SHIFT) as usize][(user & ((1 << OTHER_SHIFT) - 1)) as usize];
-    let name_of = |user: u32| -> Key { names.person(if user & OTHER != 0 { other_id(user) } else { user_id(user) }) };
+    // The `sessionize` key of a survivor's user (see `Persons`).
+    let name_of = |user: u32| -> Key { if user & OTHER != 0 { persons.of_other(other_id(user)) } else { tagged(persons.of_user(user)) } };
     let person_event = |person: Key, survivor: &Survivor| PersonEvent {
         person,
         ts: window.start + survivor.ts as i64,
@@ -1123,7 +1197,7 @@ pub fn finish(
                 }
                 let run = &kept[k..r];
                 k = r;
-                let root = link_root[person as usize];
+                let root = persons.link_root[person as usize];
                 if root == LINK_COMPLEX || home[person as usize].load(Relaxed) != shard as u32 {
                     for survivor in run {
                         let name = name_of(survivor.user);
@@ -1134,13 +1208,13 @@ pub fn finish(
                 // Finished here. Each event's person key: the root for a
                 // linked alias, else the user number itself.
                 *local_events += run.len();
-                let aliases = if root == LINK_NONE { 0 } else { link_aliases[person as usize] };
+                let aliases = if root == LINK_NONE { 0 } else { persons.link_aliases[person as usize] };
                 let person_key = |v: u32| -> u64 {
                     let alias = v & ((1 << ALIAS_BITS) - 1);
                     if alias < 64 && aliases >> alias & 1 == 1 { ROOT | root as u64 } else { v as u64 }
                 };
-                let name_of_key =
-                    |key: u64| -> Key { if key & ROOT != 0 { linked_keys[(key & !ROOT) as usize] } else { user_id(key as u32) } };
+                // Named when the rows are written (`resolver`).
+                let name_of_key = tagged;
                 let (c0, c1) = clicks_of(sorted, offsets, person);
                 let person_clicks = &sorted[c0..c1];
                 let first = person_key(run[0].user);
@@ -1203,14 +1277,16 @@ pub fn finish(
     }
     general.push(odd_general);
     let general_events: usize = general.iter().flatten().map(Vec::len).sum();
-    stats.clicks_local = stats.clicks_local.max(0);
+    // Of those, events of persons with an integer key (no name lookup).
+    let keyed_events = general.iter().flatten().flatten().filter(|e| e.person & 0xFF == TAG).count();
     eprintln!(
-        "fast-path: {} rows ({} odd event IDs, {} undecoded users); events local {} general {}; clicks local {} general {}",
+        "fast-path: {} rows ({} odd event IDs, {} undecoded users); events local {} general {} (integer-keyed {}); clicks local {} general {}",
         stats.rows,
         stats.odd_rows,
         stats.other_users,
         local_events,
         general_events,
+        keyed_events,
         stats.clicks_local,
         stats.clicks_general
     );

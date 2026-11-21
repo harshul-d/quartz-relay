@@ -3,8 +3,5 @@
 # The first line is the baseline the others are checked against.
 # ci/scaling.txt names the variants also run natively with 1, 2 and 4 threads.
 v10      v10
-fast1    c8e8a6388d12f1248ed74d43c9e64322d954ca74
+v11      v11
 head     HEAD
-s17      HEAD  PIPELINE_SHARD_BITS=17
-s18      HEAD  PIPELINE_SHARD_BITS=18
-plain    HEAD  PIPELINE_PLAIN_OUTPUT=1

@@ -179,12 +179,12 @@ fn main() {
     let user_dir = out::create_dirs(&output);
     let early_dir = early.then_some(&*user_dir);
 
-    let (results, strings) = match fast::prepare(&data, &interner, &names, linked, &lookups, &window, threads, &log) {
+    let (results, strings) = match fast::prepare(&data, &interner, linked, &lookups, &window, threads, &log) {
         Some(prepared) => {
-            let strings = interner.finish();
-            let (mut results, people, clicks) =
-                fast::finish(prepared, &names, &lookups, &window, &strings, threads, early_dir);
             drop(names);
+            let mut strings = interner.finish();
+            strings.set_resolver(prepared.resolver());
+            let (mut results, people, clicks) = fast::finish(prepared, &lookups, &window, &strings, threads, early_dir);
             log("fast path sessionized");
             let deletions = (0..PARTITIONS).map(|_| Mutex::new(Vec::new())).collect();
             results.extend(sessionize(people, deletions, clicks, &lookups, &window, &strings, threads, early_dir));

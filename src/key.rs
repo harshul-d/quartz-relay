@@ -15,6 +15,8 @@ use std::sync::Mutex;
 
 pub type Key = u128;
 const LONG_TAG: u8 = 0xFF;
+/// The low byte of the fast path's person keys (`fast::tagged`).
+const TAGGED: u8 = 0xFE;
 
 #[inline(always)]
 pub fn pack_short(bytes: &[u8]) -> Key {
@@ -93,19 +95,30 @@ impl Interner {
 
     pub fn finish(self) -> Strings {
         let (_, long) = self.map.into_inner().unwrap();
-        Strings { long }
+        Strings { long, resolve: None }
     }
 }
 
 /// Resolves keys back to bytes once parsing is done.
 pub struct Strings {
     long: Vec<Vec<u8>>,
+    /// Turns a tagged person key of the fast path (low byte 0xFE) into its name.
+    resolve: Option<Box<dyn Fn(Key) -> Key + Send + Sync>>,
 }
 
 impl Strings {
+    /// Lets `append` name the fast path's tagged person keys.
+    pub fn set_resolver(&mut self, resolve: impl Fn(Key) -> Key + Send + Sync + 'static) {
+        self.resolve = Some(Box::new(resolve));
+    }
+
     /// Appends the key's bytes to `out`.
     #[inline]
     pub fn append(&self, key: Key, out: &mut Vec<u8>) {
+        if key as u8 == TAGGED {
+            let resolve = self.resolve.as_ref().expect("a tagged key needs the fast path's resolver");
+            return self.append(resolve(key), out);
+        }
         if is_long(key) {
             out.extend_from_slice(&self.long[(key >> 8) as usize]);
         } else {
