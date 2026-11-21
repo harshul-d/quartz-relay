@@ -230,6 +230,87 @@ pub fn parse(bytes: &[u8]) -> Option<i64> {
     }
 }
 
+/// `parse` with a per-thread cache of recently seen dates: a window spans a
+/// few dozen distinct `YYYY-MM-DD`s, so the date part is validated and
+/// converted once per distinct date, keyed by its exact 10 bytes. The time
+/// part is parsed with SWAR. Same results as `parse` for every input.
+pub struct Parser {
+    /// (first 8 bytes, bytes 8-9) of a valid date; zero (impossible: the
+    /// bytes are ASCII digits and dashes) marks an empty entry.
+    keys: Vec<(u64, u16)>,
+    days: Vec<i64>,
+}
+
+const DATE_CACHE: usize = 256;
+
+impl Default for Parser {
+    fn default() -> Parser {
+        Parser { keys: vec![(0, 0); DATE_CACHE], days: vec![0; DATE_CACHE] }
+    }
+}
+
+impl Parser {
+    #[inline(always)]
+    pub fn parse(&mut self, bytes: &[u8]) -> Option<i64> {
+        let local = match bytes.len() {
+            20 if bytes[19] == b'Z' => return self.civil(bytes),
+            25 if (bytes[19] == b'+' || bytes[19] == b'-') && bytes[22] == b':' => self.civil(bytes)?,
+            0 => return None,
+            _ => return epoch_millis_fast(bytes),
+        };
+        let offset_hours = two_digits(bytes, 20)?;
+        let offset_minutes = two_digits(bytes, 23)?;
+        if offset_hours > 23 || offset_minutes > 59 {
+            return None;
+        }
+        let offset = (offset_hours * 60 + offset_minutes) * MINUTE;
+        Some(if bytes[19] == b'+' { local - offset } else { local + offset })
+    }
+
+    /// `YYYY-MM-DDTHH:MM:SS` in the first 19 bytes, as UTC milliseconds.
+    #[inline(always)]
+    fn civil(&mut self, bytes: &[u8]) -> Option<i64> {
+        let b: &[u8; 19] = bytes[..19].try_into().unwrap();
+        if b[10] != b'T' {
+            return None;
+        }
+        // Time: "HH:MM:SS" as one little-endian word; XOR maps each digit to
+        // 0-9 (and only digits) and each ':' to 0.
+        let word = u64::from_le_bytes(b[11..19].try_into().unwrap()) ^ 0x3030_3A30_303A_3030;
+        if ((word.wrapping_add(0x7676_7676_7676_7676) | word) & 0x8080_8080_8080_8080) != 0
+            || word & 0x0000_FF00_00FF_0000 != 0
+        {
+            return None;
+        }
+        let lane = |k: u32| ((word >> (8 * k)) & 0xFF) as i64;
+        let (hour, minute, second) = (lane(0) * 10 + lane(1), lane(3) * 10 + lane(4), lane(6) * 10 + lane(7));
+        if hour > 23 || minute > 59 || second > 59 {
+            return None;
+        }
+        let low = u64::from_le_bytes(b[..8].try_into().unwrap());
+        let high = u16::from_le_bytes([b[8], b[9]]);
+        let slot = ((low ^ (high as u64) << 48).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize;
+        let days = if self.keys[slot] == (low, high) {
+            self.days[slot]
+        } else {
+            let days = date_days(b)?;
+            self.keys[slot] = (low, high);
+            self.days[slot] = days;
+            days
+        };
+        Some(((days * 24 + hour) * 60 + minute) * MINUTE + second * SECOND)
+    }
+}
+
+/// Days since the epoch of a valid `YYYY-MM-DD` in the first 10 bytes.
+#[cold]
+fn date_days(b: &[u8; 19]) -> Option<i64> {
+    // `civil` validates the date and the time; the time was valid already.
+    let mut midnight = *b;
+    midnight[11..19].copy_from_slice(b"00:00:00");
+    civil(&midnight).map(|ms| ms.div_euclid(DAY))
+}
+
 /// A purchase price: ASCII digits only, value 1 to 10,000,000.
 #[inline]
 pub fn price(bytes: &[u8]) -> Option<u32> {
@@ -271,6 +352,7 @@ mod tests {
             state
         };
         let noise = b"0123456789-+:TZtz .eE\r";
+        let mut cached = Parser::default();
         for round in 0..400_000 {
             let mut text: Vec<u8> = match next() % 4 {
                 0 | 1 => {
@@ -312,6 +394,15 @@ mod tests {
                 "round {round}: {:?}",
                 String::from_utf8_lossy(&text)
             );
+            // The cached parser, cold and warm (the same text twice).
+            for _ in 0..2 {
+                assert_eq!(
+                    normalized(cached.parse(&text)),
+                    normalized(parse_simple(&text)),
+                    "cached, round {round}: {:?}",
+                    String::from_utf8_lossy(&text)
+                );
+            }
         }
         for text in [&b"99999999999999999999999"[..], b"0000000000000000000000001791071890000", b"00000000"] {
             assert_eq!(normalized(parse(text)), normalized(parse_simple(text)));

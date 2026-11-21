@@ -322,6 +322,7 @@ fn parse_events(
         people: Vec<Vec<PersonEvent>>,
         copies: Vec<Vec<EventCopy>>,
         pending: Vec<Pending>,
+        dates: ts::Parser,
     }
     fn flush(state: &mut State, names: &links::Names) {
         for row in state.pending.iter_mut() {
@@ -348,6 +349,7 @@ fn parse_events(
             people: sized_partitions(capacity),
             copies: sized_partitions(capacity),
             pending: Vec::with_capacity(BATCH),
+            dates: ts::Parser::default(),
         },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
@@ -357,12 +359,12 @@ fn parse_events(
                     }
                     let event_id = interner.key_in(bytes, event_id);
                     // ingest_ts is always valid F1; were it not, the copy sorts last.
-                    let ingest = ts::parse(ingest_text).unwrap_or(i64::MAX);
+                    let ingest = state.dates.parse(ingest_text).unwrap_or(i64::MAX);
                     'validate: {
                         if user.is_empty() || product.is_empty() {
                             break 'validate;
                         }
-                        let Some(ts) = ts::parse(ts_text) else { break 'validate };
+                        let Some(ts) = state.dates.parse(ts_text) else { break 'validate };
                         if ts < window.start || ts >= window.end {
                             break 'validate;
                         }
@@ -488,6 +490,7 @@ fn parse_clicks(
     struct State {
         parts: Vec<Vec<PersonClick>>,
         pending: Vec<(PersonClick, u64, bool)>, // click with its user in `person`, user hash, linked
+        dates: ts::Parser,
     }
     const BATCH: usize = 32;
     fn flush(state: &mut State, names: &links::Names) {
@@ -508,14 +511,18 @@ fn parse_clicks(
     let states = par::run(
         threads,
         chunks.len(),
-        |_| State { parts: sized_partitions::<PersonClick>(capacity), pending: Vec::with_capacity(BATCH) },
+        |_| State {
+            parts: sized_partitions::<PersonClick>(capacity),
+            pending: Vec::with_capacity(BATCH),
+            dates: ts::Parser::default(),
+        },
         |state, index| {
             files.with_chunk(&chunks[index], |bytes| {
                 for_each_record::<4>(bytes, |&[click_id, user, campaign, ts_text]| {
                     if click_id.is_empty() || user.is_empty() {
                         return;
                     }
-                    let Some(ts) = ts::parse(ts_text) else { return };
+                    let Some(ts) = state.dates.parse(ts_text) else { return };
                     if ts < window.click_start || ts >= window.end {
                         return;
                     }
