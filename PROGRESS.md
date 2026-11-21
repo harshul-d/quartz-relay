@@ -87,6 +87,13 @@ v10 phases, container warm (EPYC 7763 / Xeon 8573C / EPYC 9V45): lookups 0.011 /
 | H11 | Output encoding: dictionary keys within 4,096 of a base (days, counts, zero revenue, categories) through a direct table instead of hashing | 22fc20e vs cd25d12: EPYC 7763 1.913 -> 1.903 (spreads overlap), Xeon 8573C 2.206 -> 2.202, EPYC 9V45 1.268 -> 1.311 | Rejected (no clear gain), reverted |
 | H12 | Partition count 128 / 512 / 1024 vs 256 (branches `exp-p7`, `exp-p9`, `exp-p10`) | 7f6a083 (warm; events / dedup / sessionize): EPYC 9V45 p256 1.449, p128 1.497, p512 1.425, p1024 1.404 (spreads overlap; p128 dedup 0.111 vs 0.059); EPYC 7763 1.906 / 1.927 / 1.887 / 1.882 (overlap); EPYC 9V74 noisy (1.637 / 1.864 / 1.759 / 1.645) | Rejected: no clear gain, 256 stays |
 
+### After v10
+| # | Change | Result (same-job warm medians) | Decision |
+| --- | --- | --- | --- |
+| H13 | ID linking: count linked IDs per partition and fill the bit filter (atomic OR) in parallel instead of two sequential loops | 5fe3eff: ID linking 0.093 -> 0.087 / 0.090 -> 0.090 / 0.095 -> 0.093; wall within spread | No measurable effect; kept provisionally (strictly less sequential work), judged with the next set |
+| H14 | Flush: an unlinked user's partition from the hash already computed for the filter (saves one 128-bit hash per row) | 5fe3eff (with H13): EPYC 7763 1.879 -> 1.862 (overlap), Xeon 6975P 1.594 -> 1.582 (beyond spread), EPYC 7763 1.888 -> 1.897 (overlap) | Same: kept provisionally |
+| D1 | Cost attribution of events parse (diagnostic `PIPELINE_SKIP`: 1 = no dedup copies, 3 = no records at all, 4 = no lookup/scatter, 8 = nothing after tokenizing) | 952aeb4: pending | - |
+
 ### What's next (ranked by the v9 breakdown)
 1. Events read+parse (~48% of warm wall): the partition scatter in `flush` (35% of that symbol is the two 32-byte record writes to 256 x 2 streams) -> software write-combining or fewer streams; the timestamp parser (~13% of the events callback); the tokenizer's per-field unquote (`emit`, ~27% of the tokenizer).
 2. Sessionize (~20%): DenseIds probes and the counting-sort scatter in `group-events`; attribution's per-person sort and binary searches.

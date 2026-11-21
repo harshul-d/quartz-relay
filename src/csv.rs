@@ -142,12 +142,129 @@ fn emit<const N: usize>(bytes: &[u8], spans: &[(usize, usize); N], quotes: u32, 
     each(&values);
 }
 
+/// Separators of one window of input, flattened: position, whether it is a
+/// newline, and the number of `"` before it in the chunk.
+#[derive(Default)]
+struct Separators {
+    at: Vec<u32>,
+    newline: Vec<u8>,
+    quotes: Vec<u32>,
+}
+
+/// Input bytes flattened per round (the arrays stay in L1/L2).
+const WINDOW: usize = 32 << 10;
+
 /// Calls `each` with the `N` unquoted values of every well-formed line of
 /// `bytes` (a run of whole lines; the last may lack its `\n`). Malformed and
-/// empty lines are skipped. Same result as `for_each_line` + `split::<N>`,
-/// from one SIMD pass that marks separators and quotes per 64-byte block.
+/// empty lines are skipped. Same result as `for_each_line` + `split::<N>`.
+///
+/// Two steps per window: SIMD masks of `,` `\n` `"` per 64-byte block are
+/// flattened into separator arrays without data-dependent branches; then
+/// each line is checked with one compare (N - 1 commas, then a newline) and
+/// its fields are cut from the positions. (The previous single loop branched
+/// on "newline?" at every separator and mispredicted about once per line.)
 #[inline(always)]
 pub fn for_each_record<const N: usize>(bytes: &[u8], mut each: impl FnMut(&[&[u8]; N])) {
+    const { assert!(N >= 2 && N <= 8) };
+    thread_local! {
+        static SCRATCH: std::cell::RefCell<Separators> = std::cell::RefCell::new(Separators::default());
+    }
+    SCRATCH.with(|scratch| {
+        let mut scratch = scratch.borrow_mut();
+        let Separators { at, newline, quotes } = &mut *scratch;
+        at.clear();
+        newline.clear();
+        quotes.clear();
+        let length = bytes.len();
+        // The expected newline flags of one line: N - 1 commas, then `\n`.
+        let pattern = 1u64 << (8 * (N - 1));
+        let pattern_mask = if N == 8 { u64::MAX } else { (1u64 << (8 * N)) - 1 };
+        let mut quote_total = 0u32; // quotes before the current block
+        let mut line_start = 0usize; // first byte of the current line
+        let mut line_quotes = 0u32; // quotes before `line_start`
+        let mut tail = [0u8; 64];
+        let mut base = 0usize;
+        while base < length {
+            // 1. Flatten one window.
+            let window_end = (base + WINDOW).min(length);
+            while base < window_end {
+                let block: &[u8; 64] = if base + 64 <= length {
+                    bytes[base..base + 64].try_into().unwrap()
+                } else {
+                    tail.fill(0);
+                    tail[..length - base].copy_from_slice(&bytes[base..]);
+                    &tail
+                };
+                let (comma, newlines, quote) = masks(block);
+                let mut separators = comma | newlines;
+                while separators != 0 {
+                    let bit = separators.trailing_zeros();
+                    separators &= separators - 1;
+                    at.push((base + bit as usize) as u32);
+                    newline.push(((newlines >> bit) & 1) as u8);
+                    quotes.push(quote_total + (quote & ((1u64 << bit) - 1)).count_ones());
+                }
+                quote_total += quote.count_ones();
+                base += 64;
+            }
+            // Padding so the pattern load below may read 8 flags anywhere.
+            let count = at.len();
+            newline.extend_from_slice(&[0; 8]);
+
+            // 2. Whole lines.
+            let mut i = 0;
+            while i < count {
+                let flags = u64::from_le_bytes(newline[i..i + 8].try_into().unwrap());
+                if i + N <= count && flags & pattern_mask == pattern {
+                    let mut spans = [(0usize, 0usize); N];
+                    let mut start = line_start;
+                    for (k, span) in spans.iter_mut().enumerate() {
+                        let end = at[i + k] as usize;
+                        *span = (start, end);
+                        start = end + 1;
+                    }
+                    let end_quotes = quotes[i + N - 1];
+                    emit(bytes, &spans, end_quotes - line_quotes, &mut each);
+                    line_start = start;
+                    line_quotes = end_quotes;
+                    i += N;
+                    continue;
+                }
+                // Malformed (wrong field count) or not yet complete: find
+                // this line's newline.
+                match newline[i..count].iter().position(|&flag| flag != 0) {
+                    Some(offset) => {
+                        let k = i + offset;
+                        line_start = at[k] as usize + 1;
+                        line_quotes = quotes[k];
+                        i = k + 1;
+                    }
+                    None => break,
+                }
+            }
+            // Keep the separators of the unfinished line for the next window.
+            newline.truncate(count);
+            at.drain(..i);
+            newline.drain(..i);
+            quotes.drain(..i);
+        }
+        if length > 0 && bytes[length - 1] != b'\n' && at.len() == N - 1 {
+            // The last line has no `\n`; it may still end in an empty field.
+            let mut spans = [(0usize, 0usize); N];
+            let mut start = line_start;
+            for (k, span) in spans.iter_mut().enumerate() {
+                let end = if k + 1 < N { at[k] as usize } else { length };
+                *span = (start, end);
+                start = end + 1;
+            }
+            emit(bytes, &spans, quote_total - line_quotes, &mut each);
+        }
+    });
+}
+
+/// The previous single-loop tokenizer, kept as a second oracle in tests.
+#[cfg(test)]
+pub fn for_each_record_single_loop<const N: usize>(bytes: &[u8], mut each: impl FnMut(&[&[u8]; N])) {
     let length = bytes.len();
     let mut spans = [(0usize, 0usize); N];
     let mut count = 0usize; // fields ended so far in this line
@@ -410,6 +527,67 @@ mod tests {
         let mut out = Vec::new();
         for_each_record::<N>(bytes, |fields| out.push(fields.iter().map(|f| f.to_vec()).collect()));
         out
+    }
+
+    fn single_loop<const N: usize>(bytes: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for_each_record_single_loop::<N>(bytes, |fields| out.push(fields.iter().map(|f| f.to_vec()).collect()));
+        out
+    }
+
+    /// Inputs of several windows: lines (well-formed, malformed, very long,
+    /// quoted) crossing window and block boundaries, with and without a
+    /// final newline.
+    #[test]
+    fn tokenizer_matches_across_windows() {
+        let mut state = 0x0BAD_5EED_1234_4321u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for round in 0..40 {
+            let mut bytes = Vec::new();
+            let target = 20_000 + (next() % 150_000) as usize;
+            while bytes.len() < target {
+                let fields = match next() % 50 {
+                    0 => 1 + (next() % 3000) as usize, // a very long malformed line
+                    1..=3 => 1 + (next() % 9) as usize,
+                    _ => 4,
+                };
+                for field in 0..fields {
+                    if field > 0 {
+                        bytes.push(b',');
+                    }
+                    let quoted = next() % 5 == 0;
+                    if quoted {
+                        bytes.push(b'"');
+                    }
+                    for _ in 0..(next() % 14) {
+                        bytes.push(b"abcxyz019 \r"[(next() % 11) as usize]);
+                    }
+                    if next() % 300 == 0 {
+                        bytes.push(b'"');
+                    }
+                    if quoted {
+                        bytes.push(b'"');
+                    }
+                }
+                if next() % 200 == 0 {
+                    bytes.push(b'\n'); // an empty line
+                }
+                bytes.push(b'\n');
+            }
+            if round % 2 == 0 {
+                bytes.pop();
+            }
+            let expected = simple::<4>(&bytes);
+            assert_eq!(fast::<4>(&bytes), expected, "round {round}");
+            assert_eq!(single_loop::<4>(&bytes), expected, "round {round}");
+            assert_eq!(fast::<7>(&bytes), simple::<7>(&bytes), "round {round}");
+            assert_eq!(fast::<2>(&bytes), simple::<2>(&bytes), "round {round}");
+        }
     }
 
     /// The SIMD tokenizer agrees with the plain one on random dirty input.
