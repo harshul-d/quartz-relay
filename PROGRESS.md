@@ -3,7 +3,25 @@ READY TO SUBMIT: v11 2394d7b51fbcdd00214b3e8741853f2f06116f1c (Actions, 20M, sam
 # Progress
 
 ## Report: v12 (fast path for nearly everyone, one-step line splitting, SIMD timestamps)
-REPORT_V12_BODY
+**Tagged v12.** CPU and wall against v11 in the same Actions job (run f6be4a6, 20M, 4 vCPUs; native CPU-s user+sys, container warm wall median):
+
+| Runner | CPU-s v11 -> v12 | Warm wall v11 -> v12 |
+| --- | --- | --- |
+| Xeon 6975P | 4.80 -> **4.46** (-7%) | 1.373 -> **1.292** (-6%) |
+| EPYC 9V74 | 4.63 -> **4.21** (-9%) | 1.374 -> **1.267** (-8%) |
+| EPYC 9V45 | 3.39 -> **3.09** (-9%) | 1.008 -> **0.933** (-7%) |
+
+Against v10 (run 6cc0d5d, same job, v12 without its last small change F6): CPU 4.43 -> 3.22, 5.88 -> 4.34, 6.66 -> 5.15 (-23 to -27%); warm 1.293 -> 0.983, 1.661 -> 1.319, 1.879 -> 1.506 (-20 to -24%).
+
+**What changed** (details F3-F5 and D3 in "Fast path" below):
+1. *General-path people on the fast path:* every person the fast path does not finish inside one shard (whales, shared devices, people split across shards or runs, long alias chains) now has an integer key, its link root or user number, and goes through the per-person stage without any name lookup; names are produced only when rows are written. At 20M, 1,947,071 of the 1,947,175 such events (and at 60M 6,808,658 of 6,808,952) are integer-keyed; only unlinked user IDs that do not decode (104 events at 20M) keep string keys. Small on its own (-1 to -2% CPU), since those people were ~10% of events.
+2. *Event parsing:* lines are split in one step from a 64/128-byte mask window, and timestamps are parsed with SIMD (F1/F2 in one 32-byte register, F3 in one SSE register): -3 to -6% CPU, each half measurable on its own (`PIPELINE_SPLIT=blocks`, `PIPELINE_TS=old` switch them off).
+3. *From the teammate pipeline's latest commits:* link files cut into ~16 chunks per thread (ID linking 0.107 -> 0.099 s) and the key-recovery sample read while the links are (0.04-0.12 s that sat before event parsing). Also: the link-name table is built only when a run falls back to the general path, and a person's clicks sort on a plain key when no click ID is interned.
+4. *8-byte keys (item 3): not done.* After 1, string keys only remain for the 104 undecoded events, so they could only speed up a whole-run fallback, which already beats v10 (D3).
+
+**Gates on v12:** scripts/verify.ps1; differential suite also at NCPU 1, 2, 3, 16, 32 and 40 (40 is over the fast path's 32-thread limit: general path); unit tests release and debug (20, incl. new fuzz tests: ~680k splitter inputs, ~930k timestamp strings against the old code); fixtures 36/36; dev answer MATCH (fast path on and off); differential suite 33/33, also with each A/B switch (`PIPELINE_SPLIT=blocks`, `PIPELINE_TS=old`, `PIPELINE_FAST=0`); key recovery 22/22; 20M and 60M exact match with v1 (peak private 1.66 / 4.72 GiB); pyarrow/DuckDB check OK; Linux fixtures and dev answer in all Actions shards.
+
+**Next, ranked:** (1) the event-copy scatter into shards (~14% of the parse callback: write misses and the push check); (2) `finish_person` (~10% of CPU), mostly attribution; (3) the remaining 10% of events that take the per-person hash grouping could be grouped by sorting their integer keys instead.
 
 ## Report: v11, the fast path for generator-format IDs
 **Tagged v11** (same code as a7fbed1; benchmarked in run a7fbed1 against v10 in the same job, 20M, 4 vCPUs):
@@ -199,6 +217,8 @@ Adopted the teammate pipeline's idea 1 in our own design. Source of truth for th
 | # | Change | Result | Decision |
 | --- | --- | --- | --- |
 | F2 | Link classification on its own thread during event parsing; complex persons folded into `home` so a click needs one lookup, prefetched 16 clicks ahead; ingest seconds by unsigned division (a7fbed1). A/B in the same job: 2^17 and 2^18 events per shard (`PIPELINE_SHARD_BITS`), PLAIN output | CPU-s v10 / F1 / F2 / s17 / s18 / plain: EPYC 7763 7.10 / 5.92 / **5.71** / 5.74 / 5.70 / 5.76; Xeon 6975P 5.72 / 4.88 / **4.69** / 4.66 / 4.60 / 4.69; EPYC 9V45 4.76 / 3.73 / **3.50** / 3.64 / 3.71 / 3.50. Container warm v10 / F1 / F2: 2.012 / 1.785 / **1.685**; 1.590 / 1.418 / **1.343**; 1.327 / 1.131 / **1.069** | F2 kept (-3 to -6% CPU over F1 on all three). Larger shards and PLAIN: no consistent gain, defaults unchanged (2^16, dictionary output). Tagged v11 |
+| F5 | The link-name table built only when the run falls back to the general path; the key-recovery event sample read on its own thread while the links are (teammate pipeline's latest idea); a person's clicks sorted by a plain (ts, key) when no click ID is interned | 6cc0d5d vs 7233675 (F4), same job, CPU-s: 3.29 -> 3.22, 4.36 -> 4.34, 5.19 -> 5.15; warm 1.001 -> 0.983, 1.369 -> 1.319, 1.523 -> 1.506 | Kept (small, same direction on all three) |
+| F6 | Assists counted in one pass over a person's sessions (no binary searches, no per-day division) | f6be4a6 vs 6cc0d5d, same job, CPU-s: 4.51 -> 4.46, 4.31 -> 4.21, 3.15 -> 3.09; warm 1.316 -> 1.292, 1.272 -> 1.267, 0.948 -> 0.933 | Kept (small, all three runners) |
 | D3 | 8-byte keys for what stays on the general path (item 3 of the plan) | After F3, the general path's string keys carry only unlinked user IDs that do not decode: 104 events of 19.6M at 20M. Every other ID on the fast path is a 32-bit number already, and the 128-bit `Key` still has to hold tagged person keys (72 bits) and interned IDs | Not done: it would only speed up a whole-run fallback (keys not recovered), which already beats v10. Left as an option |
 | F4 | CSV lines split in one step (`csv::for_each_record_lines`: 64- or 128-byte mask window from each line start, N-1 commas before the first newline, fields cut by tzcnt; quotes only when the line has any; the old block walker stays behind `PIPELINE_SPLIT=blocks`). SIMD timestamps (`ts::Parser`: F1/F2 checked and gathered in one 32-byte register, F3 of 8-16 digits in one SSE register; old path behind `PIPELINE_TS=old`). Written by two subagents in their own worktrees with fuzz tests against the old code (~680k splitter inputs, ~930k timestamp strings) | 7233675, same job, CPU-s keys (F3) / head / head-blocks / head-tsold: EPYC 9V74 5.75 / **5.42** / 5.58 / 5.55; EPYC 9V45 4.01 / **3.80** / 4.01 / 3.89; Xeon 6975P 4.66 / **4.55** / 4.59 / 4.63. Warm 1.693 -> 1.604, 1.200 -> 1.158, 1.356 -> 1.315 | Both kept (each one alone is worse than both on all three runners) |
 | F3 | Integer person keys for everyone the fast path does not finish in one shard: a linked person's key is its link root, an unlinked user's its number; they go through `sessionize` tagged (low byte 0xFE) and `Strings` names them when rows are written, so no row needs a name lookup. Only unlinked IDs that do not decode keep a string key (their own name). Plus link files cut into ~16 chunks per thread (teammate pipeline's latest change) | 20M: 1,947,071 of the 1,947,175 general-path events now carry integer keys (104 undecoded). b920a61 vs v11, same job, CPU-s: 5.73 -> 5.65, 5.63 -> 5.56, 4.82 -> 4.73 (-1.2 to -1.9%); ID linking 0.107 -> 0.099 s; warm wall -0.3 to -1.4% | Kept (small but on all three runners; exact on all gates) |
