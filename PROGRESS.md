@@ -1,4 +1,4 @@
-READY TO SUBMIT: v11 2394d7b51fbcdd00214b3e8741853f2f06116f1c (Actions, 20M, same job, warm container median v11 vs v10: 1.685 s vs 2.012 on EPYC 7763, 1.343 vs 1.590 on Xeon 6975P, 1.069 vs 1.327 on EPYC 9V45; CPU-s 5.71 vs 7.10, 4.69 vs 5.72, 3.50 vs 4.76; v10 scored 1.54 s and v8 1.39 s on the scorer)
+READY TO SUBMIT: v12 fe225e89e3acb69191b272f879c152a17f5688f8 (Actions, 20M, same job, warm container median v12 vs v11: 1.292 s vs 1.373 on Xeon 6975P, 1.267 vs 1.374 on EPYC 9V74, 0.933 vs 1.008 on EPYC 9V45; CPU-s 4.46 vs 4.80, 4.21 vs 4.63, 3.09 vs 3.39; v11 vs v10 was -16 to -19% warm; v10 scored 1.54 s, v8 1.39 s on the scorer)
 
 # Progress
 
